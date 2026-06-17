@@ -812,6 +812,14 @@ export function renderSettings(containerId, settings, callbacks) {
                                 <small class="VectFox_hint">Independent of the EventBase "Window Size". 1 turn = 2 messages (1 user + 1 AI reply). Auto-sync extracts a window every this-many turns of new chat.</small>
                             </div>
 
+                            <div class="vectfox-form-group" style="margin-top: 12px;">
+                                <label class="vectfox-label">
+                                    Auto-sync trailing gap: <span id="VectFox_eventbase_autosync_tail_lag_messages_val">0</span> message(s)
+                                </label>
+                                <input type="range" id="VectFox_eventbase_autosync_tail_lag_messages" min="0" max="20" step="1" class="vectfox-range" />
+                                <small class="VectFox_hint">Leave the latest N messages unsynced on auto-sync runs so the vector index trails the live chat tail. Manual Vectorize Content still processes the full chat.</small>
+                            </div>
+
                             <!-- Summarizer Injection (Feature B). Whole group hidden on standard+no-plugin. -->
                             <div class="vectfox-form-group" id="VectFox_summarizer_injection_group" style="margin-top: 12px;">
                                 <label class="checkbox_label" for="VectFox_summarizer_injection_enabled">
@@ -3243,6 +3251,21 @@ function bindSettingsEvents(settings, callbacks) {
                         log.warn('[VectFox] Failed to re-stamp marker on auto-sync window change:', err?.message || err);
                     }
                 }
+            });
+    }
+
+    // Auto-sync trailing gap (messages). Feature C.
+    {
+        const _lag0 = Math.max(0, Math.min(20, Number(settings.eventbase_autosync_tail_lag_messages ?? 0)));
+        $('#VectFox_eventbase_autosync_tail_lag_messages_val').text(_lag0);
+        $('#VectFox_eventbase_autosync_tail_lag_messages')
+            .val(_lag0)
+            .on('input', function() {
+                const val = Math.max(0, Math.min(20, parseInt(this.value, 10) || 0));
+                settings.eventbase_autosync_tail_lag_messages = val;
+                $('#VectFox_eventbase_autosync_tail_lag_messages_val').text(val);
+                Object.assign(extension_settings.vectfox, settings);
+                saveSettingsDebounced();
             });
     }
 

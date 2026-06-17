@@ -211,6 +211,10 @@ const defaultSettings = {
     // uses this instead of eventbase_window_size, so its cadence is independent of the
     // one-off Vectorize Content window. Range 1-20. Default 1 (most reactive).
     eventbase_autosync_window_turns: 1,
+    // Auto-sync trailing gap: leave the latest N messages unsynced on auto-sync
+    // runs only. Useful when you want the vector index to lag slightly behind
+    // the live chat tail. Default 0 = no lag.
+    eventbase_autosync_tail_lag_messages: 0,
     // Summarizer Injection (Feature B): when enabled, inject the most recent N
     // EventBase events (by source_window_end desc) into the prompt every turn,
     // wrapped in <VectFoxSummarizer> tags — word-for-word-ish recent-turn memory,

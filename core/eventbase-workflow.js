@@ -28,23 +28,10 @@ import { formatEventsForInjectionDetailed } from './eventbase-injection.js';
 import { isCollectionEnabled, isCollectionLockedToChat, setCollectionLock, setCollectionMeta } from './collection-metadata.js';
 import { progressTracker } from '../ui/progress-tracker.js';
 import { log } from './log.js';
+import { getAutoSyncWindowSize, getAutoSyncTailLagMessages } from './eventbase-workflow-utils.js';
 
 /** Extension prompt tag for EventBase (distinct from legacy chunks tag) */
 const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
-
-/**
- * Resolve the auto-sync extraction window size in MESSAGES from the per-user
- * turns setting (1 turn = 2 messages: 1 user + 1 AI reply). Clamped to 1-20 turns.
- * Auto-sync uses this instead of settings.eventbase_window_size so its cadence is
- * independent of the one-off Vectorize Content window. Single source of truth for
- * the conversion — used by the auto-sync caller AND the auto-sync status check.
- * @param {object} settings - VectFox settings
- * @returns {number} window size in messages
- */
-export function getAutoSyncWindowSize(settings) {
-    const turns = Math.max(1, Math.min(20, settings?.eventbase_autosync_window_turns ?? 1));
-    return turns * 2;
-}
 
 // ---------------------------------------------------------------------------
 // Ingestion
@@ -134,6 +121,20 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     const disablePipeline = settings?.eventbase_disable_pipeline === true;
 
     if (!messages?.length) return { eventsExtracted: 0, windowsProcessed: 0, windowsSkipped: 0 };
+
+    if (isAutoSync) {
+        const tailLag = getAutoSyncTailLagMessages(settings);
+        if (tailLag > 0) {
+            const originalCount = messages.length;
+            const truncateTo = Math.max(0, originalCount - tailLag);
+            if (truncateTo === 0) {
+                log.lifecycle(`[EventBase] AutoSync trailing gap ${tailLag} message(s) leaves nothing to process; skipping ingestion`);
+                return { eventsExtracted: 0, windowsProcessed: 0, windowsSkipped: 0 };
+            }
+            messages = messages.slice(0, truncateTo);
+            log.lifecycle(`[EventBase] AutoSync trailing gap: leaving last ${tailLag} message(s) unsynced, processing ${messages.length}/${originalCount}`);
+        }
+    }
 
     // If the fingerprint cache says windows were extracted but Qdrant has no data
     // (e.g. collection was deleted externally), reset the cache so we start fresh.
