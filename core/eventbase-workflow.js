@@ -30,6 +30,9 @@ import { progressTracker } from '../ui/progress-tracker.js';
 import { log } from './log.js';
 import { getAutoSyncWindowSize, getAutoSyncTailLagMessages } from './eventbase-workflow-utils.js';
 
+// Re-export workflow utilities so callers can access them
+export { getAutoSyncWindowSize, getAutoSyncTailLagMessages };
+
 /** Extension prompt tag for EventBase (distinct from legacy chunks tag) */
 const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
 
@@ -179,7 +182,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     const popupAllowed = isAutoSync && !suppressAutoSyncPopup && settings.eventbase_autosync_popup !== false;
     log.verbose(`[EventBase Popup] auto-sync gate: isAutoSync=${isAutoSync}, suppressAutoSyncPopup=${suppressAutoSyncPopup}, eventbase_autosync_popup=${settings.eventbase_autosync_popup} → fire=${popupAllowed}`);
     if (popupAllowed) {
-        try { toastr.info('Auto-Sync: extracting events...', 'VectFox', { timeOut: 3000 }); } catch (_) {}
+        try { toastr.info('Auto-Sync: extracting events...', 'VectFox', { timeOut: 3000 }); } catch (_) { }
     }
 
     // Always-on trace so the user can confirm auto-sync ran without enabling debug logging.
@@ -483,7 +486,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                 // If we got here after a retry, signal recovery to the user so the
                 // earlier toast ("retrying...") gets a closing parenthesis.
                 if (attempt > 1) {
-                    try { toastr.success(`Insert recovered on attempt ${attempt}/3`, 'VectFox', { timeOut: 4000 }); } catch (_) {}
+                    try { toastr.success(`Insert recovered on attempt ${attempt}/3`, 'VectFox', { timeOut: 4000 }); } catch (_) { }
                 }
                 return; // success
             } catch (err) {
@@ -511,14 +514,14 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                     // away an in-flight retry that probably would have worked).
                     try {
                         toastr.warning(
-                            `Insert failed (attempt ${attempt}/3), retrying in ${backoffMs/1000}s. Server said: ${(err?.message || '').slice(0, 120)}`,
+                            `Insert failed (attempt ${attempt}/3), retrying in ${backoffMs / 1000}s. Server said: ${(err?.message || '').slice(0, 120)}`,
                             'VectFox — retrying',
                             { timeOut: backoffMs + 500 },
                         );
-                    } catch (_) {}
+                    } catch (_) { }
                     progressTracker.updateProgress(
                         nextBatchFirstIdx,
-                        `Insert retry ${attempt}/3 — waiting ${backoffMs/1000}s...`,
+                        `Insert retry ${attempt}/3 — waiting ${backoffMs / 1000}s...`,
                     );
                     await new Promise(r => setTimeout(r, backoffMs));
                 }
@@ -620,14 +623,14 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     // -----------------------------------------------------------------------
     let nextBatchFirstIdx = fastForwardSkipped;
     let pendingExtract = null;  // Promise<ExtractResult> | null
-    let pendingInsert  = null;  // Promise<Tally> | null
-    let queuedResult   = null;  // ExtractResult waiting for insert slot | null
+    let pendingInsert = null;  // Promise<Tally> | null
+    let queuedResult = null;  // ExtractResult waiting for insert slot | null
     // Race-wrapper promises tagged with kind so Promise.race can tell which
     // side finished. They wrap pendingExtract / pendingInsert respectively;
     // a winner.kind === 'extract' result discharges pendingExtract, and
     // 'insert' discharges pendingInsert.
     let extractKey = null;
-    let insertKey  = null;
+    let insertKey = null;
 
     while (true) {
         if (abortSignal?.aborted) {
@@ -706,7 +709,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
         // Race whichever is in flight.
         const inFlight = [];
         if (pendingExtract) inFlight.push(extractKey);
-        if (pendingInsert)  inFlight.push(insertKey);
+        if (pendingInsert) inFlight.push(insertKey);
 
         const winner = await Promise.race(inFlight);
 
@@ -756,9 +759,9 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                 progressTracker.complete(false, `EventBase fatal error: ${tally.fatalError.message}`);
                 throw tally.fatalError;
             }
-            eventsExtracted  += tally.eventsAdded;
+            eventsExtracted += tally.eventsAdded;
             windowsProcessed += tally.windowsProcessed;
-            windowsSkipped   += tally.windowsSkipped;
+            windowsSkipped += tally.windowsSkipped;
             _updateProgressAfterFinalize(winner.extractResult);
         }
     }
