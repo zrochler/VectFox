@@ -22,7 +22,9 @@ export function getAutoSyncWindowSize(settings) {
  * @returns {number}
  */
 export function getAutoSyncTailLagMessages(settings) {
-    const value = Number(settings?.eventbase_autosync_tail_lag_messages ?? 0);
-    if (!Number.isFinite(value) || value <= 0) return 0;
-    return Math.max(0, Math.trunc(value));
+    const rawValue = settings?.eventbase_autosync_tail_lag_messages;
+    const value = Number(rawValue ?? 0);
+    if (!Number.isFinite(value)) return 0;
+    const rounded = Math.trunc(value);
+    return rounded < 0 ? 0 : rounded;
 }
