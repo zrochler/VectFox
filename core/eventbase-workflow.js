@@ -28,7 +28,8 @@ import { formatEventsForInjectionDetailed } from './eventbase-injection.js';
 import { isCollectionEnabled, isCollectionLockedToChat, setCollectionLock, setCollectionMeta } from './collection-metadata.js';
 import { progressTracker } from '../ui/progress-tracker.js';
 import { log } from './log.js';
-import { getAutoSyncWindowSize, getAutoSyncTailLagMessages } from './eventbase-workflow-utils.js';
+import { expandILSMessages } from './ils-expander.js';
+import { getAutoSyncWindowSize, getAutoSyncTailLagMessages } from './eventbase-workflow.js';
 
 // Re-export workflow utilities so callers can access them
 export { getAutoSyncWindowSize, getAutoSyncTailLagMessages };
@@ -63,6 +64,10 @@ const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
  * @returns {Promise<{ eventsExtracted: number, windowsProcessed: number, windowsSkipped: number }>}
  */
 export async function runEventBaseIngestion({ messages, chatUUID, settings, abortSignal = null, progressPlan = null, collectionIdOverride = null, parallelWindows = 3, isAutoSync = false, suppressAutoSyncPopup = false, skipTipFallback = false, windowSizeOverride = undefined, windowOverlapOverride = undefined }) {
+    // Expand InlineSummary collapsed messages so EventBase extracts from original content
+    const { expanded: expandedMessages } = expandILSMessages(messages);
+    messages = expandedMessages;
+    
     const uuid = chatUUID || getChatUUID();
 
     // Respect the global collection pause toggle before doing any extraction,
@@ -1226,9 +1231,14 @@ export async function getChatAutoSyncStatus(settings) {
     if (!match) return { state: 'no-collection' };
 
     const ctx = getContext();
-    const messages = Array.isArray(ctx?.chat)
+    let messages = Array.isArray(ctx?.chat)
         ? ctx.chat.filter(m => m.mes && m.mes.trim().length > 0)
         : [];
+    
+    // Expand InlineSummary collapsed messages so auto-sync reflects actual message count
+    const { expanded: expandedMessages } = expandILSMessages(messages);
+    messages = expandedMessages;
+    
     const chatMessageCount = messages.length;
 
     // Read the auto-sync marker (per-chat message-index threshold). When this
