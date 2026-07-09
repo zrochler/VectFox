@@ -29,7 +29,7 @@ import { isCollectionEnabled, isCollectionLockedToChat, setCollectionLock, setCo
 import { progressTracker } from '../ui/progress-tracker.js';
 import { log } from './log.js';
 import { expandILSMessages } from './ils-expander.js';
-import { getAutoSyncWindowSize, getAutoSyncTailLagMessages } from './eventbase-workflow.js';
+import { getAutoSyncWindowSize, getAutoSyncTailLagMessages } from './eventbase-workflow-utils.js';
 
 // Re-export workflow utilities so callers can access them
 export { getAutoSyncWindowSize, getAutoSyncTailLagMessages };
@@ -67,7 +67,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     // Expand InlineSummary collapsed messages so EventBase extracts from original content
     const { expanded: expandedMessages } = expandILSMessages(messages);
     messages = expandedMessages;
-    
+
     const uuid = chatUUID || getChatUUID();
 
     // Respect the global collection pause toggle before doing any extraction,
@@ -1234,11 +1234,11 @@ export async function getChatAutoSyncStatus(settings) {
     let messages = Array.isArray(ctx?.chat)
         ? ctx.chat.filter(m => m.mes && m.mes.trim().length > 0)
         : [];
-    
+
     // Expand InlineSummary collapsed messages so auto-sync reflects actual message count
     const { expanded: expandedMessages } = expandILSMessages(messages);
     messages = expandedMessages;
-    
+
     const chatMessageCount = messages.length;
 
     // Read the auto-sync marker (per-chat message-index threshold). When this
