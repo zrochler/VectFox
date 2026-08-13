@@ -31,10 +31,22 @@ vi.mock('../core/core-vector-api.js', () => ({
     queryCollection: vi.fn(),
 }));
 
+// Reached via bounded-retrieval -> embedding-latency-warning, which names the
+// configured embedding provider when a retrieval times out. The real module
+// imports SillyTavern's secrets.js/textgen-settings.js, absent under vitest.
+vi.mock('../core/providers.js', () => ({
+    getModelFromSettings: (s) => s?.embedding_openrouter_model || '',
+}));
+
 vi.mock('../core/collection-metadata.js', () => ({
     getCollectionMeta: vi.fn(),
     isCollectionEnabled: vi.fn(),
     shouldCollectionActivate: vi.fn(),
+    // Read by _classifyInactiveLorebook to explain WHY a collection was skipped.
+    getCollectionLockCount: vi.fn(() => 0),
+    getCollectionCharacterLockCount: vi.fn(() => 0),
+    isCollectionLockedToChat: vi.fn(() => false),
+    isCollectionLockedToCharacter: vi.fn(() => false),
 }));
 
 vi.mock('../core/collection-ids.js', () => ({
@@ -84,6 +96,17 @@ vi.mock('../core/collection-loader.js', () => ({
 vi.mock('../core/constants.js', () => ({
     EXTENSION_PROMPT_TAG: 'vectfox_world_info',
     LOREBOOK_PROMPT_TAG: 'vectfox_lorebook',
+    // Reached via backends -> embedding-latency-warning -> retrieval-budget,
+    // which derives its slow-embed log threshold from the retrieval budget.
+    // All seven are required: retrieval-budget.js imports them by name, and a
+    // mock factory that omits one makes the import throw.
+    RETRIEVAL_TIMEOUT_DEFAULT_MS: 15000,
+    RETRIEVAL_TIMEOUT_MIN_MS: 3000,
+    RETRIEVAL_TIMEOUT_MAX_MS: 120000,
+    AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS: 30000,
+    AGENTIC_QUERY_TIMEOUT_DEFAULT_MS: 10000,
+    AGENTIC_TIMEOUT_MIN_MS: 1000,
+    AGENTIC_TIMEOUT_MAX_MS: 60000,
 }));
 
 vi.mock('../core/lorebook-rename-detector.js', () => ({

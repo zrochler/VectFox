@@ -46,6 +46,7 @@ import {
     getUrlProviders,
     resolveProviderApiUrl
 } from './providers.js';
+import { isConnectionError, notifyConnectionError } from './model-config-notifier.js';
 import { getOverfetchAmount } from './keyword-boost.js';
 import { applyBM25Scoring, porterStemmer } from './bm25-scorer.js';
 import { hybridSearch } from './hybrid-search.js';
@@ -186,10 +187,20 @@ function chunkArray(array, size) {
  * point ID. Whichever attempt wins, the data is correct. Late-arriving losers harmlessly
  * upsert the same point with identical data.
  *
- * Hedge-fatal: if all (maxHedges + 1) attempts fail (or are still in flight) by the hard
- * cutoff at (maxHedges + 1) × thresholdMs, throw an error with `name === 'HedgeFatalError'`
- * and `isHedgeFatal === true`. The shouldRetry filter in RETRY_CONFIG checks this flag and
- * skips retrying — the user can resume manually via Continue button. See
+ * Two triggers, one ordered sequence of hedges:
+ *   - the fixed schedule (t = i × thresholdMs) covers the case this was built for, an
+ *     attempt that hangs rather than returning;
+ *   - an attempt that FAILS brings the next hedge forward immediately, because the
+ *     schedule measures slowness and a failure is not slowness. Without this a fast
+ *     failure just idles until its slot (measured 2026-08-04: a 0.7s insert failure
+ *     waited 14.3s for t=15s).
+ * Attempts still cap at maxHedges + 1 either way.
+ *
+ * Hedge-fatal: if all (maxHedges + 1) attempts fail, throw an error with
+ * `name === 'HedgeFatalError'` and `isHedgeFatal === true` — immediately once the last
+ * one fails, or at the hard cutoff at (maxHedges + 1) × thresholdMs if attempts are
+ * still in flight. The shouldRetry filter in RETRY_CONFIG checks this flag and skips
+ * retrying — the user can resume manually via Continue button. See
  * plans/embedding-resilience-hedge-and-diagnostics.md §6.
  *
  * @param {Function} fn - Async function to call (each invocation must be safe to repeat)
@@ -198,7 +209,7 @@ function chunkArray(array, size) {
  * @param {object} ctx - { debugOn, batchIdx, totalBatches, provider } for logging
  * @returns {Promise<*>} - Result of the first attempt to succeed
  */
-async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
+export async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
     return new Promise((resolve, reject) => {
         let settled = false;
         const timers = [];
@@ -214,10 +225,49 @@ async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
 
         const label = (i) => (i === 0 ? 'primary' : `hedge ${i}/${maxHedges}`);
 
+        // Hedges fire in order, from either the fixed schedule below or early when an
+        // attempt fails. Both routes go through startHedge, and each slot checks
+        // `hedgesFired`, so a slot can never fire twice and the total attempt count
+        // stays at maxHedges + 1.
+        let hedgesFired = 0;
+        let attemptsInFlight = 0;
+        const hedgeTimers = new Map();
+
+        const buildHedgeFatal = () => {
+            const lastError = errors.length ? errors[errors.length - 1].error : null;
+            const tail = lastError
+                ? `last error: ${lastError?.name || 'Error'}: ${lastError?.message || lastError}`
+                : `${maxHedges + 1} attempts still in-flight at cutoff, none returned`;
+            const fatalErr = new Error(
+                `Hedge fatal: ${maxHedges + 1} attempts to ${provider} over ${((maxHedges + 1) * thresholdMs) / 1000}s — ${tail}`,
+            );
+            fatalErr.name = 'HedgeFatalError';
+            fatalErr.isHedgeFatal = true;
+            return fatalErr;
+        };
+
+        const startHedge = (i, isEarly) => {
+            if (settled || i > maxHedges) return;
+            hedgesFired = i;
+            const scheduled = hedgeTimers.get(i);
+            if (scheduled) {
+                clearTimeout(scheduled);
+                hedgeTimers.delete(i);
+            }
+            if (debugOn) {
+                log.warn(isEarly
+                    ? `VectFox: hedge ${i}/${maxHedges} firing early — batch ${batchIdx}/${totalBatches} via ${provider} (previous attempt FAILED; not waiting for t=${(i * thresholdMs) / 1000}s)`
+                    : `VectFox: hedge ${i}/${maxHedges} firing at t=${(i * thresholdMs) / 1000}s — batch ${batchIdx}/${totalBatches} via ${provider} (previous attempt still running)`);
+            }
+            fire(i);
+        };
+
         const fire = (attemptIdx) => {
             const start = performance.now();
+            attemptsInFlight++;
             fn().then(
                 (r) => {
+                    attemptsInFlight--;
                     if (settled) return; // someone else already won
                     if (attemptIdx > 0) {
                         // A hedge (not the primary) won — recovered-from anomaly.
@@ -230,6 +280,7 @@ async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
                     settle('ok', r);
                 },
                 (e) => {
+                    attemptsInFlight--;
                     errors.push({ attemptIdx, error: e });
                     if (debugOn && !settled) {
                         const elapsed = ((performance.now() - start) / 1000).toFixed(1);
@@ -248,7 +299,21 @@ async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
                         settle('err', e);
                         return;
                     }
-                    // Don't settle on other individual failures — later hedges may still succeed
+                    // Don't settle on other individual failures — later hedges may still
+                    // succeed. But don't idle either. The schedule below measures "this
+                    // attempt is slow", and a failure is not slowness: leaving the batch
+                    // dead until the next slot comes round wastes the whole threshold.
+                    // Measured 2026-08-04: an insert that 500'd after 0.7s sat idle for
+                    // 14.3s waiting for t=15s, and the log claimed "primary still slow"
+                    // about an attempt that had already failed.
+                    if (settled) return;
+                    if (hedgesFired < maxHedges) {
+                        startHedge(hedgesFired + 1, true);
+                        return;
+                    }
+                    // Last attempt, and nothing left in flight: every attempt has failed,
+                    // so the hard cutoff below can only add dead time before saying so.
+                    if (attemptsInFlight === 0) settle('err', buildHedgeFatal());
                 },
             );
         };
@@ -258,16 +323,14 @@ async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
 
         // Schedule hedges at t=thresholdMs, 2×thresholdMs, ..., maxHedges×thresholdMs
         for (let i = 1; i <= maxHedges; i++) {
-            timers.push(setTimeout(() => {
-                if (!settled) {
-                    if (debugOn) {
-                        log.warn(
-                            `VectFox: hedge ${i}/${maxHedges} firing at t=${(i * thresholdMs) / 1000}s — batch ${batchIdx}/${totalBatches} via ${provider} (primary still slow)`,
-                        );
-                    }
-                    fire(i);
-                }
-            }, i * thresholdMs));
+            const scheduled = setTimeout(() => {
+                // A failure may already have brought this slot forward; the clock must
+                // not fire it a second time.
+                if (settled || hedgesFired >= i) return;
+                startHedge(i, false);
+            }, i * thresholdMs);
+            hedgeTimers.set(i, scheduled);
+            timers.push(scheduled);
         }
 
         // Hard fatal cutoff at t=(maxHedges + 1) × thresholdMs.
@@ -275,16 +338,7 @@ async function callWithHedge(fn, thresholdMs, maxHedges, ctx) {
         // — either way, after 4 attempts to a routing-variant provider, more retries won't help.
         timers.push(setTimeout(() => {
             if (settled) return;
-            const lastError = errors.length ? errors[errors.length - 1].error : null;
-            const tail = lastError
-                ? `last error: ${lastError?.name || 'Error'}: ${lastError?.message || lastError}`
-                : `${maxHedges + 1} attempts still in-flight at cutoff, none returned`;
-            const fatalErr = new Error(
-                `Hedge fatal: ${maxHedges + 1} attempts to ${provider} over ${((maxHedges + 1) * thresholdMs) / 1000}s — ${tail}`,
-            );
-            fatalErr.name = 'HedgeFatalError';
-            fatalErr.isHedgeFatal = true;
-            settle('err', fatalErr);
+            settle('err', buildHedgeFatal());
         }, (maxHedges + 1) * thresholdMs));
     });
 }
@@ -352,12 +406,12 @@ function stripFormatting(text) {
  */
 export function getVectorsRequestBody(args = {}, settings) {
     const body = Object.assign({}, args);
-    switch (settings.source) {
+    switch (settings.embedding_provider) {
         case 'openrouter':
-            body.model = settings.openrouter_model;
+            body.model = settings.embedding_openrouter_model;
             break;
         case 'ollama':
-            body.model = settings.ollama_model;
+            body.model = settings.embedding_ollama_model;
             body.apiUrl = resolveProviderApiUrl(settings, 'ollama');
             body.keep = !!settings.ollama_keep;
             // No apiKey: ST has no ollama auth path. See backends/qdrant.js for
@@ -368,7 +422,7 @@ export function getVectorsRequestBody(args = {}, settings) {
                 ?.replace(/\/$/, '')
                 .replace(/\/v1\/embeddings$/, '')
                 .replace(/\/embeddings$/, '');
-            body.model = settings.vllm_model;
+            body.model = settings.embedding_vllm_model;
             // No apiKey passed: ST's vLLM embedding handler reads
             // SECRET_KEYS.VLLM server-side. See backends/standard.js for the
             // full rationale.
@@ -398,7 +452,7 @@ export function getVectorsRequestBody(args = {}, settings) {
  */
 export async function getAdditionalArgs(items, settings, onProgress = null) {
     const args = {};
-    switch (settings.source) {
+    switch (settings.embedding_provider) {
         // case 'webllm': args.embeddings = await createWebLlmEmbeddings(items, settings); break;
         // case 'koboldcpp': { const { embeddings, model } = await createKoboldCppEmbeddings(items, settings, onProgress); args.embeddings = embeddings; args.model = model; break; }
     }
@@ -549,7 +603,7 @@ async function createKoboldCppEmbeddings(items, settings, onProgress = null) {
  * @param {object} settings VectFox settings object
  */
 export function throwIfSourceInvalid(settings) {
-    const source = settings.source;
+    const source = settings.embedding_provider;
     const config = getProviderConfig(source);
 
     if (!config) {
@@ -621,7 +675,7 @@ export async function getSavedHashes(collectionId, settings, includeMetadata = f
             body: JSON.stringify({
                 backend: backendName === 'standard' ? 'vectra' : backendName,
                 collectionId: collectionId,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
                 limit: 10000
             })
@@ -662,8 +716,8 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
 
     try {
         // If source requires client-side embeddings, use streaming approach
-        if (clientSideEmbeddingSources.includes(settings.source)) {
-            log.lifecycle(`VectFox: Streaming embeddings and writing for ${settings.source}...`);
+        if (clientSideEmbeddingSources.includes(settings.embedding_provider)) {
+            log.lifecycle(`VectFox: Streaming embeddings and writing for ${settings.embedding_provider}...`);
 
             // Extract text strings - getAdditionalArgs expects string[], not objects
             const textStrings = items.map(item => {
@@ -709,7 +763,7 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
             const groupEmbeddingCall = settings?.vector_group_embedding_call === true;
             const shouldParallelSplit = (
                 !groupEmbeddingCall
-                && !localGpuSources.has(settings.source)
+                && !localGpuSources.has(settings.embedding_provider)
                 && !hasRateLimit
                 && items.length > 1
             );
@@ -718,7 +772,7 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
             // Also force 1-item batches when parallel-split experiment is active.
             const BATCH_SIZE = shouldParallelSplit
                 ? 1
-                : ((!hasExplicitBatchSize && localGpuSources.has(settings.source)) ? 1 : configuredBatchSize);
+                : ((!hasExplicitBatchSize && localGpuSources.has(settings.embedding_provider)) ? 1 : configuredBatchSize);
             const batches = chunkArray(items, BATCH_SIZE);
 
             log.verbose(`VectFox: Processing ${items.length} items in ${batches.length} batch(es) of up to ${BATCH_SIZE}${hasRateLimit ? ` with rate limit (Max ${settings.rate_limit_calls} calls / ${settings.rate_limit_interval}s)` : ''}${shouldParallelSplit ? ` [parallel-split: ${batches.length} concurrent POSTs in waves of up to 16]` : ''}`);
@@ -734,7 +788,7 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
             const HEDGE_MAX_COUNT = 3;
             const hedgeEnabled = (
                 rawHedgeAfterMs > 0
-                && !localGpuSources.has(settings.source)
+                && !localGpuSources.has(settings.embedding_provider)
             );
             const hedgeAfterMs = hedgeEnabled ? rawHedgeAfterMs : 0;
 
@@ -753,7 +807,7 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
                     const attemptStart = performance.now();
                     const debugOn = log.enabled('verbose');
                     log.verbose(
-                        `VectFox: insert batch ${batchIdx}/${batches.length} attempt ${attemptCount}/${RETRY_CONFIG.maxAttempts} — POST ${batchItemCount} item(s) via ${settings.source}${hedgeEnabled ? ' [hedge armed]' : ''}`,
+                        `VectFox: insert batch ${batchIdx}/${batches.length} attempt ${attemptCount}/${RETRY_CONFIG.maxAttempts} — POST ${batchItemCount} item(s) via ${settings.embedding_provider}${hedgeEnabled ? ' [hedge armed]' : ''}`,
                     );
                     try {
                         if (abortSignal?.aborted) throw Object.assign(new Error('Vectorization stopped by user'), { name: 'AbortError' });
@@ -763,7 +817,7 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
                                 debugOn,
                                 batchIdx,
                                 totalBatches: batches.length,
-                                provider: settings.source,
+                                provider: settings.embedding_provider,
                             });
                         } else {
                             await insertCall();
@@ -786,7 +840,7 @@ export async function insertVectorItems(collectionId, items, settings, onProgres
                         if (debugOn) {
                             const elapsed = ((performance.now() - attemptStart) / 1000).toFixed(1);
                             log.warn(
-                                `VectFox: insert batch ${batchIdx}/${batches.length} attempt ${attemptCount}/${RETRY_CONFIG.maxAttempts} FAILED after ${elapsed}s — ${err?.name || 'Error'}: ${err?.message || err} (provider=${settings.source}, items=${batchItemCount})`,
+                                `VectFox: insert batch ${batchIdx}/${batches.length} attempt ${attemptCount}/${RETRY_CONFIG.maxAttempts} FAILED after ${elapsed}s — ${err?.name || 'Error'}: ${err?.message || err} (provider=${settings.embedding_provider}, items=${batchItemCount})`,
                             );
                         }
                         throw err;
@@ -899,11 +953,23 @@ async function streamEmbeddingsAndWrite(backend, collectionId, items, textString
                 return await getAdditionalArgs(batchTextStrings, settings);
             }, RETRY_CONFIG);
         } catch (error) {
-            throw new Error(`VectFox: Failed to generate embeddings for batch ${batchNum} after retries: ${error.message}`);
+            // A wrong/unreachable embedding URL surfaces here, NOT at the DB-write
+            // step below — so a connection failure must be reported as an embedder
+            // problem, not a storage one (the #4/#5 conflation). Resolve the
+            // configured embedding URL (URL-based providers only) for the toast.
+            if (isConnectionError(error?.message)) {
+                let embedUrl = null;
+                try { embedUrl = resolveProviderApiUrl(settings, settings.embedding_provider) || null; } catch (_) { /* not a URL provider */ }
+                notifyConnectionError('Embedding', embedUrl, error.message);
+            }
+            throw Object.assign(
+                new Error(`VectFox: Failed to generate embeddings for batch ${batchNum} after retries: ${error.message}`),
+                { code: 'embedding_generation_failed' },
+            );
         }
 
         if (!additionalArgs.embeddings) {
-            throw new Error(`VectFox: No embeddings returned from ${settings.source} for batch ${batchNum}`);
+            throw new Error(`VectFox: No embeddings returned from ${settings.embedding_provider} for batch ${batchNum}`);
         }
 
         // Attach embeddings to items and validate
@@ -931,7 +997,7 @@ async function streamEmbeddingsAndWrite(backend, collectionId, items, textString
         }
 
         if (missingEmbeddings > 0) {
-            throw new Error(`VectFox: Failed to generate embeddings for ${settings.source} - ${missingEmbeddings} items missing in batch`);
+            throw new Error(`VectFox: Failed to generate embeddings for ${settings.embedding_provider} - ${missingEmbeddings} items missing in batch`);
         }
 
         // VEC-6: Write batch to database with retry logic
@@ -1011,21 +1077,21 @@ export async function queryCollection(collectionId, searchText, topK, settings, 
     let queryVector = null;
 
     // If source requires client-side embeddings, generate query vector
-    if (clientSideEmbeddingSources.includes(settings.source)) {
+    if (clientSideEmbeddingSources.includes(settings.embedding_provider)) {
         const queryItem = [searchText];
         try {
             const additionalArgs = await getAdditionalArgs(queryItem, settings);
             // additionalArgs.embeddings is a Record<string, number[]> where keys are original text
             if (additionalArgs.embeddings && additionalArgs.embeddings[searchText]) {
                 queryVector = additionalArgs.embeddings[searchText];
-                log.verbose(`[EventBase] Embedding model (${settings.source}) returned vector: dim=${queryVector.length}, first5=[${queryVector.slice(0, 5).map(v => v.toFixed(4)).join(', ')}], last5=[${queryVector.slice(-5).map(v => v.toFixed(4)).join(', ')}], model=${additionalArgs.model || 'n/a'}`);
+                log.verbose(`[EventBase] Embedding model (${settings.embedding_provider}) returned vector: dim=${queryVector.length}, first5=[${queryVector.slice(0, 5).map(v => v.toFixed(4)).join(', ')}], last5=[${queryVector.slice(-5).map(v => v.toFixed(4)).join(', ')}], model=${additionalArgs.model || 'n/a'}`);
             } else {
                 // VEC-35: Fallback to server-side embedding instead of failing completely
-                log.warn(`[VectFox] Client-side embedding generation returned empty result for ${settings.source}, falling back to server-side embedding`);
+                log.warn(`[VectFox] Client-side embedding generation returned empty result for ${settings.embedding_provider}, falling back to server-side embedding`);
             }
         } catch (clientEmbedError) {
             // VEC-35: Fallback to server-side embedding when client-side fails
-            log.warn(`[VectFox] Client-side embedding failed for ${settings.source}: ${clientEmbedError.message}. Falling back to server-side embedding.`);
+            log.warn(`[VectFox] Client-side embedding failed for ${settings.embedding_provider}: ${clientEmbedError.message}. Falling back to server-side embedding.`);
         }
     }
 
@@ -1198,7 +1264,7 @@ export async function queryMultipleCollections(collectionIds, searchText, topK, 
     let queryVector = null;
 
     // Generate query vector once for all collections (efficiency)
-    if (clientSideEmbeddingSources.includes(settings.source)) {
+    if (clientSideEmbeddingSources.includes(settings.embedding_provider)) {
         try {
             // getAdditionalArgs expects string[], not objects
             const additionalArgs = await getAdditionalArgs([searchText], settings);
@@ -1207,11 +1273,11 @@ export async function queryMultipleCollections(collectionIds, searchText, topK, 
                 queryVector = additionalArgs.embeddings[searchText];
             } else {
                 // VEC-35: Fallback to server-side embedding instead of failing completely
-                log.warn(`[VectFox] Client-side embedding generation returned empty result for ${settings.source}, falling back to server-side embedding`);
+                log.warn(`[VectFox] Client-side embedding generation returned empty result for ${settings.embedding_provider}, falling back to server-side embedding`);
             }
         } catch (clientEmbedError) {
             // VEC-35: Fallback to server-side embedding when client-side fails
-            log.warn(`[VectFox] Client-side embedding failed for ${settings.source}: ${clientEmbedError.message}. Falling back to server-side embedding.`);
+            log.warn(`[VectFox] Client-side embedding failed for ${settings.embedding_provider}: ${clientEmbedError.message}. Falling back to server-side embedding.`);
         }
     }
 

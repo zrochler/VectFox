@@ -35,6 +35,7 @@ import { throwIfModelConfigError } from '../core/model-http-errors.js';
 import { VECTOR_LIST_LIMIT } from '../core/constants.js';
 import { getQdrantApiKey } from '../core/api-keys.js';
 import { log } from '../core/log.js';
+import { warnIfEmbeddingSlow } from '../core/embedding-latency-warning.js';
 
 const BACKEND_TYPE = 'qdrant';
 
@@ -58,8 +59,47 @@ function _warnDimensionMismatch(errorBody) {
 // embedding provider is the bottleneck — not Qdrant. This note is appended to
 // query-failure logs so the embedding step is never misattributed to Qdrant.
 function _embedTimeoutHint(settings) {
-    const source = settings?.source || 'transformers';
+    const source = settings?.embedding_provider || 'transformers';
     return `NOTE: this request embeds server-side via '${source}' before querying Qdrant. Qdrant on LAN answers in <50ms, so a timeout/504 here points to the embedding provider ('${source}'), NOT Qdrant.`;
+}
+
+/**
+ * Embed the query text ONCE via the plugin's /get-embedding route, so the vector
+ * can be reused across every Qdrant request this turn instead of letting each
+ * query route re-embed the same string server-side. The route has existed since
+ * the plugin's initial commit, so no plugin-version gate is needed.
+ *
+ * Throws on any failure — the hybrid path's single fallback owner
+ * (core/hybrid-search.js) catches and degrades to client-side fusion, exactly as
+ * it does for a failed hybrid query.
+ *
+ * @param {string} searchText - query text to embed
+ * @param {object} settings - VectFox settings (provider, model, provider params)
+ * @returns {Promise<{vector: number[], embedMs: number}>}
+ */
+async function _fetchQueryEmbedding(searchText, settings) {
+    const tStart = performance.now();
+    const response = await fetch('/api/plugins/similharity/get-embedding', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            text: searchText,
+            source: settings.embedding_provider || 'transformers',
+            model: getModelFromSettings(settings),
+            ...getPluginProviderParams(settings),
+        }),
+    });
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => '(no body)');
+        const failMs = (performance.now() - tStart).toFixed(1);
+        log.warn(`[Qdrant timing] get-embedding FAILED after ${failMs}ms (HTTP ${response.status}). ${_embedTimeoutHint(settings)} Server said: ${errorBody.slice(0, 300)}`);
+        throw new Error(`[Qdrant] Query embedding failed: ${response.status} ${response.statusText} - ${errorBody.slice(0, 300)}`);
+    }
+    const data = await response.json();
+    if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
+        throw new Error('[Qdrant] Query embedding failed: plugin returned no embedding vector');
+    }
+    return { vector: data.embedding, embedMs: performance.now() - tStart };
 }
 
 // NOTE: `vectfox_main` is kept verbatim for on-disk compatibility
@@ -70,7 +110,7 @@ const MULTITENANCY_COLLECTION = 'vectfox_main';
 function getPluginProviderParams(settings) {
     const params = {};
 
-    switch (settings.source) {
+    switch (settings.embedding_provider) {
         case 'ollama':
             params.apiUrl = resolveProviderApiUrl(settings, 'ollama');
             params.keep = !!settings.ollama_keep;
@@ -136,7 +176,7 @@ export class QdrantBackend extends VectorBackend {
         } else {
             // Local mode: use host and port
             config = {
-                host: settings.qdrant_host || 'localhost',
+                host: settings.qdrant_host || '127.0.0.1',
                 port: settings.qdrant_port || 6333,
                 // Explicitly clear cloud settings to prevent conflicts
                 url: null,
@@ -253,7 +293,7 @@ export class QdrantBackend extends VectorBackend {
         const body = {
             backend: BACKEND_TYPE,
             collectionId: actualCollectionId,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
             limit: VECTOR_LIST_LIMIT,
         };
@@ -352,7 +392,7 @@ export class QdrantBackend extends VectorBackend {
                             sparseVector: encodeSparseVector(textWithKeywords),
                         };
                     }),
-                    source: settings.source || 'transformers',
+                    source: settings.embedding_provider || 'transformers',
                     model: getModelFromSettings(settings),
                     nativeSparse: true,
                     cjkTokenizerMode: settings.cjk_tokenizer_mode,
@@ -382,7 +422,7 @@ export class QdrantBackend extends VectorBackend {
 
                 throwIfModelConfigError({
                     contextLabel: 'Embedding',
-                    provider: settings.source,
+                    provider: settings.embedding_provider,
                     model: getModelFromSettings(settings),
                     status: response.status,
                     responseText: errorBody,
@@ -420,7 +460,7 @@ export class QdrantBackend extends VectorBackend {
             backend: BACKEND_TYPE,
             collectionId: actualCollectionId,
             hashes: hashes,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
         };
 
@@ -455,7 +495,7 @@ export class QdrantBackend extends VectorBackend {
             searchText: searchText,
             topK: topK,
             threshold: 0.0,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
             eventbaseDebug: !!settings.eventbase_debug_qdrant_backend,
             ...getPluginProviderParams(settings),
@@ -500,7 +540,7 @@ export class QdrantBackend extends VectorBackend {
             log.warn(`[Qdrant timing] queryCollection FAILED after ${failMs}ms (HTTP ${response.status}). ${_embedTimeoutHint(settings)} Server said: ${errorBody.slice(0, 300)}`);
             throwIfModelConfigError({
                 contextLabel: 'Embedding',
-                provider: settings.source,
+                provider: settings.embedding_provider,
                 model: getModelFromSettings(settings),
                 status: response.status,
                 responseText: errorBody,
@@ -512,8 +552,9 @@ export class QdrantBackend extends VectorBackend {
         const data = await response.json();
         if (log.enabled('verbose')) {
             const totalMs = (performance.now() - tNetStart).toFixed(1);
-            log.verbose(`[Qdrant timing] queryCollection total=${totalMs}ms (incl. server-side embed via '${settings.source || 'transformers'}'), results=${data.results?.length || 0}`);
+            log.verbose(`[Qdrant timing] queryCollection total=${totalMs}ms (incl. server-side embed via '${settings.embedding_provider || 'transformers'}'), embed=${data.timings?.embedMs ?? 'n/a'}ms, qdrant=${data.timings?.queryMs ?? 'n/a'}ms, results=${data.results?.length || 0}`);
         }
+        warnIfEmbeddingSlow(data.timings?.embedMs, settings, 'query');
 
         // Format results to match expected output
         const hashes = data.results.map(r => r.hash);
@@ -556,7 +597,7 @@ export class QdrantBackend extends VectorBackend {
                     searchText: searchText,
                     topK: topK,
                     threshold: threshold,
-                    source: settings.source || 'transformers',
+                    source: settings.embedding_provider || 'transformers',
                     model: getModelFromSettings(settings),
                     ...getPluginProviderParams(settings),
                 };
@@ -623,7 +664,7 @@ export class QdrantBackend extends VectorBackend {
         const body = {
             backend: BACKEND_TYPE,
             collectionId: actualCollectionId,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
         };
 
@@ -669,7 +710,7 @@ export class QdrantBackend extends VectorBackend {
         const response = await fetch(`/api/plugins/similharity/chunks/${encodeURIComponent(hash)}?` + new URLSearchParams({
             backend: BACKEND_TYPE,
             collectionId: actualCollectionId, // Use separate collection per content type
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
         }), {
             headers: getRequestHeaders(),
@@ -696,7 +737,7 @@ export class QdrantBackend extends VectorBackend {
             body: JSON.stringify({
                 backend: BACKEND_TYPE,
                 collectionId: actualCollectionId, // Use separate collection per content type
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
                 offset: options.offset || 0,
                 limit: options.limit || 100,
@@ -724,7 +765,7 @@ export class QdrantBackend extends VectorBackend {
                 backend: BACKEND_TYPE,
                 collectionId: actualCollectionId, // Use separate collection per content type
                 text: newText,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
             }),
         });
@@ -749,7 +790,7 @@ export class QdrantBackend extends VectorBackend {
                 backend: BACKEND_TYPE,
                 collectionId: actualCollectionId, // Use separate collection per content type
                 metadata: metadata,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
             }),
         });
@@ -773,7 +814,7 @@ export class QdrantBackend extends VectorBackend {
             body: JSON.stringify({
                 backend: BACKEND_TYPE,
                 collectionId: actualCollectionId, // Use separate collection per content type
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
             }),
         });
@@ -806,7 +847,18 @@ export class QdrantBackend extends VectorBackend {
 
     /**
      * Perform hybrid search using Qdrant's sparse + dense vector capabilities.
-     * Falls back to regular vector search if hybrid endpoint is unavailable.
+     *
+     * Score contract: each result's `score` is the COSINE similarity (0-1) from a
+     * parallel dense-only lookup, NOT the RRF fused score — RRF is rank-derived
+     * (top hit ≈ 1/(rrfK+1) ≈ 0.016) and carries no similarity magnitude, which
+     * silently defeated every downstream threshold (world_info_threshold,
+     * score_threshold) tuned for 0-1 similarities. Result ORDER is still the RRF
+     * fusion order; the raw fused score is kept as `fusionScore`.
+     *
+     * Throws on failure — it does NOT degrade to vector-only itself. Fallback for
+     * the hybrid path is owned solely by core/hybrid-search.js::hybridSearch.
+     * The one exception is a vector-dimension mismatch, which returns an empty
+     * result because no other path could succeed either.
      *
      * @param {string} collectionId - Collection to query
      * @param {string} searchText - Query text
@@ -862,17 +914,48 @@ export class QdrantBackend extends VectorBackend {
             const { encodeSparseQuery } = await import('../core/sparse-vector-encoder.js');
             sparseQueryVector = encodeSparseQuery(searchText);
         } catch (error) {
+            // Throw rather than falling back here. Fallback for the whole hybrid
+            // path is owned by core/hybrid-search.js — see the "single fallback
+            // owner" note on the catch at the end of this method.
             log.warn('[Qdrant] sparse query setup failed:', error?.message);
-            return this.queryCollection(collectionId, searchText, topK, settings);
+            throw new Error(`[Qdrant] Sparse query setup failed for ${collectionId}: ${error?.message || error}`, { cause: error });
         }
+
+        // Embed the query ONCE and reuse the vector for both requests below.
+        // Previously each request sent searchText and the plugin re-embedded it
+        // server-side — the dominant cost of the whole retrieval (measured
+        // 2.9s-16s via OpenRouter vs 18-23ms for the Qdrant query itself).
+        const { vector: queryVector, embedMs } = await _fetchQueryEmbedding(searchText, settings);
+        warnIfEmbeddingSlow(embedMs, settings, 'get-embedding');
+
+        const prefetchLimit = topK * 4;
+
+        // Cosine gate: RRF fused scores are rank-derived (top hit ≈ 1/(rrfK+1) =
+        // 0.0164 at k=60) — they carry NO similarity magnitude, so thresholding
+        // them is meaningless. Every consumer of this method (lorebook WI's
+        // world_info_threshold, the chunk pipeline's score_threshold) gates on a
+        // 0-1 similarity, which is what Vectra returns and what these collections
+        // measure natively (created with distance: 'Cosine'). So: a parallel
+        // dense-only lookup fetches the real cosine per hash, and the returned
+        // `score` is COSINE — RRF keeps deciding ordering and candidate
+        // membership via the hybrid query itself. A sparse-leg hit that ranks
+        // outside the dense lookup window has no cosine → scores 0 → gated: a
+        // keyword match with no semantic similarity does not clear a similarity
+        // threshold (deliberate, decided 2026-07-31).
+        const cosineLookupPromise = this.queryCollection(collectionId, searchText, prefetchLimit, settings, queryVector)
+            .catch(error => ({ __cosineLookupError: error }));
 
         const body = {
             backend: BACKEND_TYPE,
             collectionId: actualCollectionId,
+            // queryVector makes the plugin skip its server-side embed; searchText
+            // is still sent so a plugin old enough to ignore queryVector simply
+            // embeds it itself and keeps working.
+            queryVector,
             searchText: searchText,
             topK: topK,
             threshold: 0.0,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
             hybrid: true,
             hybridOptions: {
@@ -881,7 +964,7 @@ export class QdrantBackend extends VectorBackend {
                 fusionMethod,
                 rrfK,
                 eventbaseDebug: !!settings.eventbase_debug_qdrant_backend,
-                prefetchLimit: topK * 4,
+                prefetchLimit,
             },
             sparseQueryVector,
             ...getPluginProviderParams(settings),
@@ -909,47 +992,74 @@ export class QdrantBackend extends VectorBackend {
 
         const tNetStart = performance.now();
 
+        // Single fallback owner: this method no longer degrades to vector-only on
+        // its own. core/hybrid-search.js::hybridSearch catches whatever we throw and
+        // runs the client-side fusion path, which issues ONE vector query and adds
+        // BM25 re-ranking on top — strictly better than the raw vector-only retry
+        // this used to do, and one HTTP round-trip cheaper. Two independent fallback
+        // layers previously fired in sequence, so a single failing query cost three
+        // requests (hybrid-query, our retry, then hybrid-search's) and the caller
+        // still received an empty result it could not distinguish from "no match".
+        let response;
         try {
-            const response = await fetch('/api/plugins/similharity/chunks/hybrid-query', {
+            response = await fetch('/api/plugins/similharity/chunks/hybrid-query', {
                 method: 'POST',
                 headers: getRequestHeaders(),
                 body: JSON.stringify(body),
             });
-
-            if (response.ok) {
-                const data = await response.json();
-                const totalMs = (performance.now() - tNetStart).toFixed(1);
-                log.verbose(`[Qdrant timing] total=${totalMs}ms, results=${data.results?.length || 0}`);
-
-                return {
-                    hashes: data.results.map(r => r.hash),
-                    metadata: data.results.map(r => ({
-                        hash: r.hash,
-                        text: r.text,
-                        score: r.score,
-                        vectorScore: r.vectorScore,
-                        textScore: r.textScore,
-                        fusionMethod: r.fusionMethod || 'rrf',
-                        hybridSearch: true,
-                        nativeSparse: true,
-                        ...r.metadata,
-                    }))
-                };
-            }
-
-            const errorBody = await response.text().catch(() => '(no body)');
-            const failMs = (performance.now() - tNetStart).toFixed(1);
-            if (_isDimensionMismatch(errorBody)) {
-                _warnDimensionMismatch(errorBody);
-                return { hashes: [], metadata: [] };
-            }
-            log.warn(`[Qdrant timing] hybridQuery FAILED after ${failMs}ms (HTTP ${response.status}), falling back to vector-only. ${_embedTimeoutHint(settings)} Server said: ${errorBody.slice(0, 500)}`);
         } catch (error) {
             const failMs = (performance.now() - tNetStart).toFixed(1);
             log.warn(`[Qdrant timing] hybridQuery FAILED after ${failMs}ms (exception): ${error.message}. ${_embedTimeoutHint(settings)}`);
+            throw error;
         }
 
-        return this.queryCollection(collectionId, searchText, topK, settings);
+        if (response.ok) {
+            const data = await response.json();
+            const totalMs = (performance.now() - tNetStart).toFixed(1);
+            log.verbose(`[Qdrant timing] total=${totalMs}ms, clientEmbed=${embedMs.toFixed(0)}ms, serverEmbed=${data.timings?.embedMs ?? 'n/a'}ms, qdrant=${data.timings?.queryMs ?? 'n/a'}ms, results=${data.results?.length || 0}`);
+            // serverEmbed is normally null (we sent queryVector); non-null means an
+            // old plugin ignored it and embedded anyway — still worth surfacing.
+            warnIfEmbeddingSlow(data.timings?.embedMs, settings, 'hybrid-query');
+
+            // Cosine gate join (see the comment at cosineLookupPromise). A lookup
+            // failure throws — the single fallback owner in hybrid-search.js
+            // degrades to client-side fusion, whose scores are already 0-1.
+            const cosineLookup = await cosineLookupPromise;
+            if (cosineLookup.__cosineLookupError) throw cosineLookup.__cosineLookupError;
+            const cosineScoreByHash = new Map(cosineLookup.metadata.map(m => [m.hash, m.score]));
+
+            return {
+                hashes: data.results.map(r => r.hash),
+                metadata: data.results.map(r => ({
+                    hash: r.hash,
+                    text: r.text,
+                    // score is COSINE similarity (0-1) so every downstream
+                    // threshold means "how similar", same as Vectra. Array order
+                    // stays the RRF fusion order; the raw fused score is kept as
+                    // fusionScore for debugging.
+                    score: cosineScoreByHash.get(r.hash) ?? 0,
+                    fusionScore: r.score,
+                    vectorScore: r.vectorScore,
+                    textScore: r.textScore,
+                    fusionMethod: r.fusionMethod || 'rrf',
+                    hybridSearch: true,
+                    nativeSparse: true,
+                    ...r.metadata,
+                }))
+            };
+        }
+
+        const errorBody = await response.text().catch(() => '(no body)');
+        const failMs = (performance.now() - tNetStart).toFixed(1);
+        if (_isDimensionMismatch(errorBody)) {
+            // Deliberate dead end, NOT a fallback: a dimension mismatch fails
+            // identically on every path, so retrying vector-only would just burn
+            // another round-trip. _warnDimensionMismatch already told the user.
+            _warnDimensionMismatch(errorBody);
+            return { hashes: [], metadata: [] };
+        }
+        log.warn(`[Qdrant timing] hybridQuery FAILED after ${failMs}ms (HTTP ${response.status}). ${_embedTimeoutHint(settings)} Server said: ${errorBody.slice(0, 500)}`);
+        throw new Error(`[Qdrant] Hybrid query failed for ${collectionId}: ${response.status} ${response.statusText} - ${errorBody.slice(0, 500)}`);
     }
 
     /**
@@ -1022,7 +1132,7 @@ export class QdrantBackend extends VectorBackend {
             searchText,
             topK,
             threshold: 0.0,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: getModelFromSettings(settings),
             hybrid: true,
             hybridOptions: {
@@ -1058,7 +1168,8 @@ export class QdrantBackend extends VectorBackend {
             if (response.ok) {
                 const data = await response.json();
                 const totalMs = (performance.now() - tNetStart).toFixed(1);
-                log.verbose(`[Qdrant timing] hybrid+rerank total=${totalMs}ms, results=${data.results?.length || 0}`);
+                log.verbose(`[Qdrant timing] hybrid+rerank total=${totalMs}ms, embed=${data.timings?.embedMs ?? 'n/a'}ms, qdrant=${data.timings?.queryMs ?? 'n/a'}ms, results=${data.results?.length || 0}`);
+                warnIfEmbeddingSlow(data.timings?.embedMs, settings, 'hybrid-query-rerank');
 
                 return {
                     hashes: data.results.map(r => r.hash),

@@ -25,7 +25,7 @@ import { getSavedHashes } from './core-vector-api.js';
 import { retrieveEvents } from './eventbase-retrieval.js';
 import { retrieveEventsWithAgent } from './agentic-retrieval.js';
 import { formatEventsForInjectionDetailed } from './eventbase-injection.js';
-import { isCollectionEnabled, isCollectionLockedToChat, setCollectionLock, setCollectionMeta } from './collection-metadata.js';
+import { isCollectionEnabled, isCollectionActiveForContextAnyKey, setCollectionLock, setCollectionMeta } from './collection-metadata.js';
 import { progressTracker } from '../ui/progress-tracker.js';
 import { log } from './log.js';
 import { expandILSMessages } from './ils-expander.js';
@@ -36,6 +36,48 @@ export { getAutoSyncWindowSize, getAutoSyncTailLagMessages };
 
 /** Extension prompt tag for EventBase (distinct from legacy chunks tag) */
 const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
+
+/**
+ * Resolve the auto-sync extraction window size in MESSAGES from the per-user
+ * turns setting (1 turn = 2 messages: 1 user + 1 AI reply). Clamped to 1-20 turns.
+ * Auto-sync uses this instead of settings.eventbase_window_size so its cadence is
+ * independent of the one-off Vectorize Content window. Single source of truth for
+ * the conversion — used by the auto-sync caller AND the auto-sync status check.
+ * @param {object} settings - VectFox settings
+ * @returns {number} window size in messages
+ */
+export function getAutoSyncWindowSize(settings) {
+    const turns = Math.max(1, Math.min(20, settings?.eventbase_autosync_window_turns ?? 1));
+    return turns * 2;
+}
+
+/**
+ * Settle/commit lag boundary: the number of messages eligible for auto-sync
+ * extraction. The last `lag` messages — the active, still-swipeable turn — are
+ * held back until a newer message supersedes them, so re-rolls/swipes on the
+ * latest turn never produce throwaway embeddings (only the final, superseded
+ * turn is extracted).
+ *
+ * Returns a *count* (an exclusive upper index) so callers can
+ * `messages.slice(0, getCommitBoundary(messages, settings))`.
+ *
+ * Lag is one whole auto-sync window (one turn) so windows tile evenly and the
+ * held-back region is exactly the active turn — never a stray incomplete tail.
+ * Returns `messages.length` (no lag) when the feature is off. This is the SINGLE
+ * source of truth shared by the window-builder, the quick-exit, and the LED /
+ * counter so "fully synced" means "all committed windows done", not "the active
+ * turn done". See plans/autosync-settle-lag.md.
+ *
+ * @param {object[]} messages - filtered chat messages
+ * @param {object}   settings - VectFox settings
+ * @returns {number} count of messages eligible for extraction
+ */
+export function getCommitBoundary(messages, settings) {
+    const total = Array.isArray(messages) ? messages.length : 0;
+    if (settings?.eventbase_autosync_settle_lag === false) return total; // feature off → no lag
+    const lag = getAutoSyncWindowSize(settings);
+    return Math.max(0, total - lag);
+}
 
 // ---------------------------------------------------------------------------
 // Ingestion
@@ -61,8 +103,26 @@ const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
  * @param {object}   params.settings    - VectFox settings
  * @param {AbortSignal|null} [params.abortSignal]
  * @param {{ strategy?: string, batchSize?: number, totalChunks?: number }|null} [params.progressPlan]
- * @returns {Promise<{ eventsExtracted: number, windowsProcessed: number, windowsSkipped: number }>}
+ * @returns {Promise<{ eventsExtracted: number, windowsProcessed: number, windowsSkipped: number, windowsTimedOut?: number, windowsFailed?: number }>}
  */
+/**
+ * How many windows this run left unfinished — they produced no events, were not
+ * marked extracted, and will be retried next run.
+ *
+ * Lives here because this module owns the counters, and BOTH callers that report
+ * a run to the user need the same answer. Neither used to ask: each ended with an
+ * unconditional progressTracker.complete(true, …) + toastr.success(…), which
+ * overwrote the complete(false, …) verdict this workflow had just set. So a run
+ * where a window timed out or failed still showed the user a green tick — the
+ * same silence issue #14 reported, one layer further out.
+ *
+ * @param {{windowsTimedOut?: number, windowsFailed?: number}|null|undefined} result
+ * @returns {number}
+ */
+export function countUnfinishedWindows(result) {
+    return (result?.windowsTimedOut || 0) + (result?.windowsFailed || 0);
+}
+
 export async function runEventBaseIngestion({ messages, chatUUID, settings, abortSignal = null, progressPlan = null, collectionIdOverride = null, parallelWindows = 3, isAutoSync = false, suppressAutoSyncPopup = false, skipTipFallback = false, windowSizeOverride = undefined, windowOverlapOverride = undefined }) {
     // Expand InlineSummary collapsed messages so EventBase extracts from original content
     const { expanded: expandedMessages } = expandILSMessages(messages);
@@ -70,9 +130,25 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
 
     const uuid = chatUUID || getChatUUID();
 
-    // Respect the global collection pause toggle before doing any extraction,
-    // ingestion, or insertion work. Pause is a hard stop regardless of chat locks.
-    const collectionId = collectionIdOverride || buildEventBaseCollectionId(uuid, settings?.vector_backend);
+    // Resolve the write target. Precedence:
+    //   1. Explicit override (archive uploads pass a fixed ID; auto-sync passes the
+    //      collection it already resolved for its gate).
+    //   2. The chat's ACTIVE collection from the registry — the source of truth.
+    //   3. A freshly-built ID, ONLY for first-time ingestion when no collection
+    //      exists yet (resolve returns null).
+    //
+    // Step 2 is load-bearing for group chats. buildEventBaseCollectionId derives the
+    // ID's char segment from the LIVE context.name2, which in a group chat is whoever
+    // is speaking on this trigger. Recomputing it per call would manufacture and lock
+    // a NEW per-character EventBase collection for the same chat every time a
+    // different character speaks, scattering events across siblings that the
+    // summarizer (which reads only resolveActiveEventBaseCollection) never sees.
+    // Trusting the registry instead of recomputing the ID is the rule in
+    // Doc/collection_helper.md — the registry is the source of truth for which
+    // collection holds a chat's data.
+    const collectionId = collectionIdOverride
+        || resolveActiveEventBaseCollection(settings, uuid)?.collectionId
+        || buildEventBaseCollectionId(uuid, settings?.vector_backend);
 
     // Lock to current chat at start so the index is populated even if vectorization is interrupted.
     // Archive collections are excluded — they are locked manually by the user.
@@ -173,9 +249,18 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     // If it's already extracted, all prior windows are done too (processed in order).
     // Avoids building O(n/step) window objects on every auto-sync fire when nothing is new.
     // Note: edits to messages deep in history bypass this check — acceptable limitation.
+    // Settle/commit lag: on auto-sync, hold back the active (still-swipeable) last
+    // turn — only extract messages up to the commit boundary. Manual Vectorize
+    // Content / backfill (isAutoSync=false) covers the whole chat. The boundary is
+    // the SINGLE source of truth for "what is eligible", reused by the LED/counter
+    // (see getChatAutoSyncStatus) so "fully synced" tracks committed windows, not
+    // the active turn. See plans/autosync-settle-lag.md.
+    const commitBoundary = isAutoSync ? getCommitBoundary(messages, settings) : messages.length;
+    const committedMessages = commitBoundary < messages.length ? messages.slice(0, commitBoundary) : messages;
+
     const _msgHash = m => { const t = (m.mes || '').trim(); return m.hash ?? _djb2(`${m.name || ''}:${t}`); };
-    if (isLastWindowExtracted(messages, windowSize, step, uuid, _msgHash)) {
-        log.lifecycle(`[EventBase] Quick-exit: last window already extracted, nothing new`);
+    if (isLastWindowExtracted(committedMessages, windowSize, step, uuid, _msgHash)) {
+        log.lifecycle(`[EventBase] Quick-exit: last committed window already extracted, nothing new`);
         return { eventsExtracted: 0, windowsProcessed: 0, windowsSkipped: 0 };
     }
 
@@ -195,8 +280,8 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     if (isAutoSync) log.lifecycle(`[VectFox AutoSync] running — messages=${messages.length}, popupShown=${popupAllowed}`);
 
     let windows = [];
-    for (let start = 0; start < messages.length; start += step) {
-        const end = Math.min(start + windowSize - 1, messages.length - 1);
+    for (let start = 0; start < commitBoundary; start += step) {
+        const end = Math.min(start + windowSize - 1, commitBoundary - 1);
         const msgs = messages.slice(start, end + 1);
         if (msgs.length < windowSize) break; // tail is incomplete — wait for more messages
         windows.push({ start, end, msgs });
@@ -253,6 +338,28 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
     let eventsExtracted = 0;
     let windowsProcessed = 0;
     let windowsSkipped = 0;
+    let windowsTimedOut = 0;
+    let windowsFailed = 0;
+    let firstFailureDetail = null;
+
+    // First-timeout toast — fire once per run, the moment a window times out,
+    // instead of leaving the user staring at a silent "0 vectors" at the end
+    // (the #2 bug). A per-call timeout almost always means the model/endpoint is
+    // too slow or unreachable, so it's actionable. Shown regardless of the
+    // auto-sync popup/progress-modal settings because it's an error, not progress.
+    let _timeoutToastShown = false;
+    const _notifyFirstTimeout = () => {
+        if (_timeoutToastShown) return;
+        _timeoutToastShown = true;
+        const secs = Math.round((settings.eventbase_timeout_ms || 60000) / 1000);
+        try {
+            toastr.error(
+                `EventBase extraction timed out after ${secs}s. Raise "Extraction Timeout" in the EventBase settings, or check that your model/endpoint is responding. Events from timed-out windows were not stored.`,
+                'VectFox — EventBase timeout',
+                { timeOut: 0, extendedTimeOut: 0 },
+            );
+        } catch (_) { /* toastr unavailable (e.g. unit tests) */ }
+    };
 
     // Smart fast-forward: windows are processed in order, so already-extracted ones
     // cluster at the front. Linear-scan past them with cheap Set.has() lookups instead
@@ -411,18 +518,40 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                     const extractMs = performance.now() - extractStart;
                     log.verbose(`[EventBase concurrency] Window ${wIdx}: LLM extract done in ${extractMs.toFixed(0)}ms (finished at +${(performance.now() - batchStartedAt).toFixed(1)}ms from batch start)`);
                 } catch (err) {
-                    // User/request cancellation is expected and should not be logged as a failure.
-                    if (err?.name === 'AbortError' || abortSignal?.aborted) {
-                        log.verbose(`[EventBase] Window ${wIdx}: request aborted`);
+                    // Genuine user/request cancellation — expected, stay silent.
+                    // The user's abortSignal isn't wired into the extractor fetch
+                    // (it uses AbortSignal.timeout only), so a user cancel surfaces
+                    // here via abortSignal.aborted, not as the timeout below.
+                    if (abortSignal?.aborted) {
+                        log.verbose(`[EventBase] Window ${wIdx}: request aborted by user`);
                         return { skipped: true };
                     }
                     if (err instanceof EventBaseFatalError) throw err; // propagate
+                    // A per-call timeout (AbortSignal.timeout) rejects with a
+                    // TimeoutError — NOT a user cancel. Silently skipping it is the
+                    // #2 bug: every window times out → "0 vectors, no error". Detect
+                    // it (same test as agentic-retrieval.js), warn loudly, fire the
+                    // one-shot toast, and mark the window timedOut so the run reports it.
+                    const isTimeout = err?.name === 'TimeoutError'
+                        || err?.name === 'AbortError'
+                        || /aborted|timeout|timed out/i.test(err?.message || '');
+                    if (isTimeout) {
+                        const secs = Math.round((settings.eventbase_timeout_ms || 60000) / 1000);
+                        log.warn(`[EventBase] Window ${wIdx}: extraction TIMED OUT after ${secs}s (skipped). Raise "Extraction Timeout" in EventBase settings, or check your model/endpoint is responding.`);
+                        _notifyFirstTimeout();
+                        return { skipped: false, events: [], timedOut: true };
+                    }
+                    // `failed: true` keeps an errored window out of the processed
+                    // tally. Counting it as processed is what let a run where EVERY
+                    // window failed still finish green with "extracted 0 event(s)
+                    // from N window(s)" — indistinguishable from a chat that
+                    // genuinely held no events (issue #14).
                     if (err instanceof EventBaseExtractionError) {
                         log.warn(`[EventBase] Window ${wIdx}: extraction error (skipped) — ${err.message}`);
-                        return { skipped: false, events: [] };
+                        return { skipped: false, events: [], failed: true, failureDetail: err.message };
                     }
                     log.warn(`[EventBase] Window ${wIdx}: unexpected error (skipped) — ${err.message}`);
-                    return { skipped: false, events: [] };
+                    return { skipped: false, events: [], failed: true, failureDetail: err.message };
                 }
 
                 // Attach chat_uuid to each event
@@ -572,7 +701,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
 
         // Tally results, watch for fatal LLM errors (extract-side fatals
         // arrive as rejected promises in batchResults).
-        const tally = { eventsAdded: 0, windowsProcessed: 0, windowsSkipped: 0, fatalError: null };
+        const tally = { eventsAdded: 0, windowsProcessed: 0, windowsSkipped: 0, windowsTimedOut: 0, windowsFailed: 0, failureDetail: null, fatalError: null };
         for (const result of batchResults) {
             if (result.status === 'rejected') {
                 const err = result.reason;
@@ -581,9 +710,21 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                     return tally; // coordinator handles the fatal
                 }
                 log.warn('[EventBase] Batch window error:', err?.message || err);
+                tally.windowsFailed++;
+                tally.failureDetail ??= err?.message || String(err);
             } else {
                 if (result.value?.skipped) {
                     tally.windowsSkipped++;
+                } else if (result.value?.timedOut) {
+                    // Counted separately — NOT as "processed" (it produced no events
+                    // and wasn't marked extracted, so it retries next run).
+                    tally.windowsTimedOut++;
+                } else if (result.value?.failed) {
+                    // Same reasoning as timedOut: no events, not marked extracted,
+                    // so it must not inflate the processed count that the final
+                    // success message reports.
+                    tally.windowsFailed++;
+                    tally.failureDetail ??= result.value.failureDetail || null;
                 } else {
                     tally.windowsProcessed++;
                     tally.eventsAdded += (result.value?.events?.length || 0);
@@ -651,7 +792,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                 try { await pendingExtract; } catch (_) { /* swallow */ }
             }
             progressTracker.complete(false, 'Stopped by user');
-            return { eventsExtracted, windowsProcessed, windowsSkipped };
+            return { eventsExtracted, windowsProcessed, windowsSkipped, windowsTimedOut, windowsFailed };
         }
 
         // Decide what can start this iteration. Order is load-bearing:
@@ -745,7 +886,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                 }
                 if (winner.error?.name === 'AbortError') {
                     progressTracker.complete(false, 'Stopped by user');
-                    return { eventsExtracted, windowsProcessed, windowsSkipped };
+                    return { eventsExtracted, windowsProcessed, windowsSkipped, windowsTimedOut, windowsFailed };
                 }
                 // Surface the Qdrant error to the user. EventBaseFatalError
                 // is caught at the UI layer and turned into a popup.
@@ -767,6 +908,9 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
             eventsExtracted += tally.eventsAdded;
             windowsProcessed += tally.windowsProcessed;
             windowsSkipped += tally.windowsSkipped;
+            windowsTimedOut += tally.windowsTimedOut;
+            windowsFailed += tally.windowsFailed;
+            firstFailureDetail ??= tally.failureDetail;
             _updateProgressAfterFinalize(winner.extractResult);
         }
     }
@@ -824,9 +968,25 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
         }
     }
 
-    progressTracker.complete(true, `EventBase: extracted ${eventsExtracted} event(s) from ${windowsProcessed} window(s)`);
+    // A timed-out window is a real failure (the immediate toast already told the
+    // user). Reflect it in the progress modal too rather than a misleading green
+    // "success" — especially when timeouts swallowed the whole run (0 events).
+    if (windowsTimedOut > 0) {
+        progressTracker.complete(false,
+            `EventBase: ${windowsTimedOut} window(s) timed out — ${eventsExtracted} event(s) extracted. See the timeout notice; raise "Extraction Timeout" or check your endpoint.`);
+    } else if (windowsFailed > 0) {
+        // A window that errored stored nothing and was never marked extracted, so
+        // reporting the run green told the user "this chat has no events" when the
+        // truth was "every request failed" (issue #14). Name the first reason —
+        // these failures are near-always the same cause repeated.
+        progressTracker.complete(false,
+            `EventBase: ${windowsFailed} window(s) failed — ${eventsExtracted} event(s) extracted.`
+            + (firstFailureDetail ? ` First error: ${firstFailureDetail}` : ' See the console for details.'));
+    } else {
+        progressTracker.complete(true, `EventBase: extracted ${eventsExtracted} event(s) from ${windowsProcessed} window(s)`);
+    }
 
-    log.lifecycle(`[EventBase] Ingestion complete: extracted=${eventsExtracted}, processed=${windowsProcessed}, skipped=${windowsSkipped}`);
+    log.lifecycle(`[EventBase] Ingestion complete: extracted=${eventsExtracted}, processed=${windowsProcessed}, skipped=${windowsSkipped}, timedOut=${windowsTimedOut}, failed=${windowsFailed}`);
 
     // Record the window size used for this successful run. Vectorize Content →
     // Continue compares against this on the next click to detect window-size
@@ -845,7 +1005,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
         }));
     }
 
-    return { eventsExtracted, windowsProcessed, windowsSkipped };
+    return { eventsExtracted, windowsProcessed, windowsSkipped, windowsTimedOut, windowsFailed };
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +1042,7 @@ function _gatherArchiveEventCollections(currentChatId) {
             continue;
         }
 
-        const isLocked = candidateKeys.some(key => isCollectionLockedToChat(key, currentChatId));
+        const isLocked = isCollectionActiveForContextAnyKey(candidateKeys, { chatId: currentChatId });
         if (!isLocked) {
             log.trace(`[EventBase] Archive event collection skipped (not locked to chat): ${colId}`);
             continue;
@@ -924,7 +1084,7 @@ function _gatherLockedEventBaseCollections(currentChatId) {
             continue;
         }
 
-        const isLocked = candidateKeys.some(key => isCollectionLockedToChat(key, currentChatId));
+        const isLocked = isCollectionActiveForContextAnyKey(candidateKeys, { chatId: currentChatId });
         if (!isLocked) {
             log.trace(`[EventBase] Live collection skipped (not locked to chat): ${colId}`);
             continue;
@@ -1002,7 +1162,10 @@ export async function runEventBaseRetrieval({ chat, searchText, settings, chatUU
             // query through settings.vector_backend.
             const { hashes, metadata } = await queryCollection(archKey, effectiveSearchText, topK, ebSettings);
             if (!hashes?.length) return [];
-            return metadata.map((meta, i) => ({ ...meta, _hash: hashes[i] }));
+            // _sortFrame tags each archive event with its source collection so the
+            // injector groups by conversation before the chronological sort
+            // (source_window_end is only comparable within one conversation).
+            return metadata.map((meta, i) => ({ ...meta, _hash: hashes[i], _sortFrame: archColId }));
         } catch (err) {
             log.error(`[EventBase] Archive event collection query failed (${archColId}):`, err);
             return [];
@@ -1265,7 +1428,16 @@ export async function getChatAutoSyncStatus(settings) {
     // Evaluate auto-sync "fully vectorized" against the AUTO-SYNC window (turns*2,
     // overlap 0), not the one-off Vectorize Content window — otherwise the LED
     // would read "partial" forever whenever the two window sizes differ.
-    const fullyVectorized = isChatFullyVectorized(messages, settings, uuid, getAutoSyncWindowSize(settings), 0);
+    //
+    // Settle/commit lag: evaluate against the COMMITTED slice (chat minus the
+    // active, still-swipeable last turn), matching what runEventBaseIngestion
+    // actually extracts. Without this, the deliberately-unextracted active turn
+    // would pin the LED on "partial" forever. After a manual full vectorize the
+    // committed slice's last window is also extracted, so the LED is still green —
+    // both modes stay consistent. See plans/autosync-settle-lag.md.
+    const commitBoundary = getCommitBoundary(messages, settings);
+    const committedMessages = commitBoundary < messages.length ? messages.slice(0, commitBoundary) : messages;
+    const fullyVectorized = isChatFullyVectorized(committedMessages, settings, uuid, getAutoSyncWindowSize(settings), 0);
 
     // Cache-first read; one-time probe on cold cache populates from Qdrant.
     // After first session-warmup, the ingestion loop keeps this up-to-date
@@ -1278,6 +1450,7 @@ export async function getChatAutoSyncStatus(settings) {
         collectionId: match.collectionId,
         registryKey: match.registryKey,
         chatMessageCount,
+        commitBoundary,
         markerValue: typeof markerValue === 'number' ? markerValue : undefined,
         vectorizationTip: typeof vectorizationTip === 'number' ? vectorizationTip : undefined,
     };

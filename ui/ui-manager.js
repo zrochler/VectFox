@@ -12,7 +12,7 @@
 
 import { saveSettingsDebounced, getCurrentChatId, eventSource, event_types, getRequestHeaders } from '../../../../../script.js';
 import { extension_settings, openThirdPartyExtensionMenu, getContext } from '../../../../extensions.js';
-import { writeSecret, SECRET_KEYS, secret_state, readSecretState } from '../../../../secrets.js';
+import { writeSecret, deleteSecret, SECRET_KEYS, secret_state, readSecretState } from '../../../../secrets.js';
 import {
     getOpenRouterApiKey,
     getCustomApiKey,
@@ -28,6 +28,7 @@ import { openSearchDebugModal, openQueryTestModal, getLastSearchDebug } from './
 import { openTextCleaningManager } from './text-cleaning-manager.js';
 import { progressTracker } from './progress-tracker.js';
 import { resetBackendHealth } from '../backends/backend-manager.js';
+import { runNetworkStartup } from '../core/network-startup.js';
 import { getHealthIndicatorHtml, getHealthModalHtml, initializeHealthDashboard, refreshIndicator as refreshHealthIndicator } from './health-dashboard.js';
 import { doesChatHaveVectors, getCollectionRegistry, getCollectionListing, checkPluginAvailable } from '../core/collection-loader.js';
 import { getCollectionMeta } from '../core/collection-metadata.js';
@@ -36,6 +37,24 @@ import { getModelField } from '../core/providers.js';
 import { getChunkingStrategies } from '../core/content-types.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from '../core/bm25-scorer.js';
 import { LANGUAGE_MODES } from '../core/language-modes.js';
+import {
+    RETRIEVAL_TIMEOUT_DEFAULT_MS,
+    RETRIEVAL_TIMEOUT_MIN_MS,
+    RETRIEVAL_TIMEOUT_MAX_MS,
+    AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS,
+    AGENTIC_QUERY_TIMEOUT_DEFAULT_MS,
+    AGENTIC_TIMEOUT_MIN_MS,
+    AGENTIC_TIMEOUT_MAX_MS,
+    AGENTIC_MAX_TOKENS_DEFAULT,
+    AGENTIC_MAX_TOKENS_MIN,
+    AGENTIC_MAX_TOKENS_MAX,
+} from '../core/constants.js';
+import {
+    resolveRetrievalTimeoutMs,
+    resolveAgenticPlannerTimeoutMs,
+    resolveAgenticQueryTimeoutMs,
+    resolveAgenticMaxTokens,
+} from '../core/retrieval-budget.js';
 import { log } from '../core/log.js';
 
 /**
@@ -64,6 +83,15 @@ export function renderSettings(containerId, settings, callbacks) {
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
+
+                    <!-- Master switch — global enable/disable for all VectFox runtime work -->
+                    <div class="vectfox-master-switch">
+                        <label class="checkbox_label" for="VectFox_master_enabled" style="font-weight: 600;">
+                            <input type="checkbox" id="VectFox_master_enabled" />
+                            <span>Enable VectFox</span>
+                        </label>
+                        <small class="VectFox_hint" id="VectFox_master_hint">Master switch. When off, VectFox stops all automatic retrieval injection, auto-sync, and lorebook injection. Manual tools (Database Browser, Vectorize Content) stay available.</small>
+                    </div>
 
                     <!-- Tab Navigation -->
                     <div class="vectfox-tabs">
@@ -148,6 +176,15 @@ export function renderSettings(containerId, settings, callbacks) {
                                     • Standard: ST's built-in Vectra (best for &lt;100k vectors)<br>
                                     • Qdrant: Production-grade with HNSW, filtering, cloud support
                                 </small>
+                                <!-- Persistent notice shown whenever the Similharity plugin is absent,
+                                     explaining why the Qdrant option is disabled. Distinct from the
+                                     transient red revert alert below. -->
+                                <small id="VectFox_qdrant_plugin_notice" class="VectFox_hint" style="display:none; color:#e0a44a; font-weight:600; margin-top:-8px; margin-bottom:16px; line-height:1.5;">
+                                    ⚠ Similharity plugin not detected. <a href="https://github.com/KritBlade/VectFox/tree/Similharity-Plugin#step-2-install-plugin-via-git-recommended" target="_blank" rel="noopener noreferrer">Install</a> the plugin for Qdrant backend.
+                                </small>
+                                <small id="VectFox_qdrant_plugin_error" class="VectFox_hint" style="display:none; color:#e04a4a; font-weight:600; margin-top:-8px; margin-bottom:16px; line-height:1.5;">
+                                    ⚠ Qdrant requires the Similharity server plugin, which is not installed. Install the plugin to use this backend, or switch to Standard.
+                                </small>
 
                                 <!-- Qdrant Settings (shown only when Qdrant backend is selected) -->
                                 <div id="VectFox_qdrant_settings" style="display: none;">
@@ -161,7 +198,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                         <label for="VectFox_qdrant_host">
                                             <small>Qdrant Host:</small>
                                         </label>
-                                        <input type="text" id="VectFox_qdrant_host" class="vectfox-input" placeholder="localhost" />
+                                        <input type="text" id="VectFox_qdrant_host" class="vectfox-input" placeholder="127.0.0.1" />
 
                                         <label for="VectFox_qdrant_port">
                                             <small>Qdrant Port:</small>
@@ -208,6 +245,16 @@ export function renderSettings(containerId, settings, callbacks) {
                                     <p class="vectfox-card-subtitle">Embedding provider and model</p>
                                 </div>
 
+                                <div style="margin: 4px 0 12px 0; padding: 8px 10px; border: 1px solid var(--crimson, #c0392b); border-left-width: 3px; border-radius: 4px; background: rgba(192, 57, 43, 0.08);">
+                                    <small style="color: var(--crimson, #e74c3c); font-weight: 600;">
+                                        <i class="fa-solid fa-triangle-exclamation"></i>
+                                        Do NOT change the embedding provider or model after a collection's first vectorization.
+                                    </small>
+                                    <small style="display: block; margin-top: 4px; opacity: 0.85;">
+                                        Existing vectors were built with the original model — mixing models in one collection breaks retrieval. To switch, re-vectorize the collection from scratch.
+                                    </small>
+                                </div>
+
                                 <label for="VectFox_source">
                                     <small>Embedding Provider</small>
                                 </label>
@@ -227,7 +274,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                             <input type="checkbox" id="VectFox_ollama_use_alt_endpoint" />
                                             <span>Use Alternative Endpoint</span>
                                         </label>
-                                        <input type="text" id="VectFox_ollama_alt_endpoint_url" class="vectfox-input" placeholder="http://localhost:11434" />
+                                        <input type="text" id="VectFox_ollama_alt_endpoint_url" class="vectfox-input" placeholder="http://127.0.0.1:11434" />
                                         <small class="VectFox_hint">Override default Ollama API URL</small>
                                         <label for="VectFox_ollama_model" style="margin-top: 8px;">
                                             <small>Ollama Model:</small>
@@ -246,7 +293,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                             <input type="checkbox" id="VectFox_vllm_use_alt_endpoint" />
                                             <span>Use Alternative Endpoint</span>
                                         </label>
-                                        <input type="text" id="VectFox_vllm_alt_endpoint_url" class="vectfox-input" placeholder="http://localhost:8000" />
+                                        <input type="text" id="VectFox_vllm_alt_endpoint_url" class="vectfox-input" placeholder="http://127.0.0.1:8000" />
                                         <small class="VectFox_hint">Override default vLLM API URL</small>
                                         <label for="VectFox_vllm_model" style="margin-top: 8px;">
                                             <small>vLLM Model:</small>
@@ -257,6 +304,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                             <small>vLLM API Key (optional):</small>
                                         </label>
                                         <input type="password" id="VectFox_vllm_api_key" class="vectfox-input" placeholder="Leave blank for local / no-auth deployments" autocomplete="off" />
+                                        <button type="button" id="VectFox_vllm_api_key_clear" class="menu_button" style="margin-top:4px; width:auto; white-space:nowrap;"><i class="fa-solid fa-trash-can"></i> Clear saved key</button>
                                     </div>
 
                                     <!-- OpenRouter Model -->
@@ -276,6 +324,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                             <small>OpenRouter API Key:</small>
                                         </label>
                                         <input type="password" id="VectFox_openrouter_apikey" class="vectfox-input" placeholder="Paste key here to save..." autocomplete="off" />
+                                        <button type="button" id="VectFox_openrouter_apikey_clear" class="menu_button" style="margin-top:4px; width:auto; white-space:nowrap;"><i class="fa-solid fa-trash-can"></i> Clear saved key</button>
                                     </div>
 
                                 </div>
@@ -372,6 +421,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                         </label>
                                         <input type="password" id="VectFox_summarize_openrouter_apikey" class="vectfox-input"
                                             placeholder="Paste key here to save..." autocomplete="off" />
+                                        <button type="button" id="VectFox_summarize_openrouter_apikey_clear" class="menu_button" style="margin-top:4px; width:auto; white-space:nowrap;"><i class="fa-solid fa-trash-can"></i> Clear saved key</button>
                                         <small class="VectFox_hint">Stored in VectFox settings (separate from the embedding key)</small>
                                     </div>
 
@@ -380,13 +430,14 @@ export function renderSettings(containerId, settings, callbacks) {
                                             <small>vLLM Base URL</small>
                                         </label>
                                         <input type="text" id="VectFox_summarize_vllm_url" class="vectfox-input"
-                                            placeholder="http://localhost:8000" />
+                                            placeholder="http://127.0.0.1:8000" />
                                         <small class="VectFox_hint">Base URL of your vLLM server (OpenAI-compatible)</small>
                                         <label for="VectFox_summarize_vllm_apikey" style="margin-top:8px;">
                                             <small>vLLM API Key <span style="opacity:0.6;">(optional — leave blank if not required)</span></small>
                                         </label>
                                         <input type="password" id="VectFox_summarize_vllm_apikey" class="vectfox-input"
                                             placeholder="Paste key here to save..." autocomplete="off" />
+                                        <button type="button" id="VectFox_summarize_vllm_apikey_clear" class="menu_button" style="margin-top:4px; width:auto; white-space:nowrap;"><i class="fa-solid fa-trash-can"></i> Clear saved key</button>
                                     </div>
 
                                     <label for="VectFox_summarize_model">
@@ -402,6 +453,30 @@ export function renderSettings(containerId, settings, callbacks) {
                                     <select id="VectFox_summarize_model_list" class="vectfox-select" style="display:none; margin-top:6px;"></select>
                                     <small class="VectFox_hint">Model ID used for EventBase extraction (separate from embedding model). Required. Click <b>Choose</b> to browse the provider's model list.</small>
 
+                                </div>
+
+                                <div class="vectfox-form-group" style="margin-top: 12px;">
+                                    <label class="checkbox_label" for="VectFox_should_send_temperature">
+                                        <input type="checkbox" id="VectFox_should_send_temperature" />
+                                        <span>Send temperature</span>
+                                    </label>
+                                    <small class="VectFox_hint">Default (checked). Uncheck for reasoning models (gpt-5.x, o1/o3/o4 and hosted builds on them), which accept only their own default temperature and reject anything else with <i>"Unsupported value: 'temperature' does not support 0.2 with this model"</i>. Unchecked = the parameter is left out of the request; the model's default applies. Affects every LLM call: summarization, EventBase, Auto-Reformat, Agent Mode.</small>
+                                </div>
+
+                                <div class="vectfox-form-group" style="margin-top: 12px;">
+                                    <label class="checkbox_label" for="VectFox_should_use_max_completion_tokens">
+                                        <input type="checkbox" id="VectFox_should_use_max_completion_tokens" />
+                                        <span>Use max_completion_tokens</span>
+                                    </label>
+                                    <small class="VectFox_hint">Default (unchecked) sends the classic <code>max_tokens</code>. Check it for the same reasoning models, which reject that key with <i>"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead"</i>. The token limit itself is unchanged — only the parameter name. Affects every LLM call.</small>
+                                </div>
+
+                                <div class="vectfox-form-group" style="margin-top: 12px;">
+                                    <label class="checkbox_label" for="VectFox_should_disable_thinking">
+                                        <input type="checkbox" id="VectFox_should_disable_thinking" />
+                                        <span>Turn off model thinking</span>
+                                    </label>
+                                    <small class="VectFox_hint">Default (checked) sends <code>reasoning_effort: "none"</code>, so a reasoning model answers without thinking first — much faster, and it can't spend the whole token limit thinking and return nothing. Uncheck to let models think. Affects every LLM call.</small>
                                 </div>
                             </div>
 
@@ -454,6 +529,12 @@ export function renderSettings(containerId, settings, callbacks) {
                                     </label>
                                     <small class="VectFox_hint">A3 (Qdrant) only. Computes importance/persist/recency weighted scoring inside Qdrant via a formula query, in the same /query call as the dense+sparse hybrid. Anchor boost and pairwise dedup still run locally. Requires Qdrant 1.13+; falls back gracefully when unavailable. Re-tune the cosine weight if recall changes — see plans/qdrant-native-eventbase-rerank-formula.md.</small>
                                 </div>
+
+                                <label for="VectFox_retrieval_timeout_ms" style="margin-top: 12px;">
+                                    <small>Retrieval Timeout (ms)</small>
+                                </label>
+                                <input type="number" id="VectFox_retrieval_timeout_ms" class="vectfox-input" min="${RETRIEVAL_TIMEOUT_MIN_MS}" max="${RETRIEVAL_TIMEOUT_MAX_MS}" step="1000" />
+                                <small class="VectFox_hint">How long one turn may wait for a lookup — EventBase, chunks, lorebook and summarizer injection alike — before the message sends <b>without</b> that memory. Default <b>${RETRIEVAL_TIMEOUT_DEFAULT_MS} ms (${RETRIEVAL_TIMEOUT_DEFAULT_MS / 1000}s)</b>, range ${RETRIEVAL_TIMEOUT_MIN_MS / 1000}–${RETRIEVAL_TIMEOUT_MAX_MS / 1000}s. Raise it if you see "retrieval timed out" on a provider you know is just slow rather than broken. Cost of raising it: a genuinely hung provider stalls your turn for that much longer. <b>Agent Mode is already accounted for</b> — its planner and per-query timeouts are added on top of this, so you do not need to inflate this value for it.</small>
 
                                 <div style="margin-top: 12px;">
                                     <label class="checkbox_label" for="VectFox_retrieval_popup_on_start">
@@ -642,6 +723,76 @@ export function renderSettings(containerId, settings, callbacks) {
                             <input type="range" id="VectFox_insert_batch_size" class="vectfox-slider" min="10" max="100" step="10" />
                             <small class="VectFox_hint">Chunks per insert batch (50-100 recommended for faster bulk operations)</small>
 
+                            <label class="checkbox_label" for="VectFox_document_glossary_injection" style="margin-top:12px;">
+                                <input type="checkbox" id="VectFox_document_glossary_injection" />
+                                <span>Acronym Glossary Injection (Documents)</span>
+                            </label>
+                            <small class="VectFox_hint">When vectorizing a <b>Document</b>, scan it once for "Full Name (ACRONYM)" definitions and prepend the matching definition to any chunk that references the bare acronym without it. Fixes retrieval handing the model an ungrounded acronym it then has to guess at.</small>
+
+                            <!-- Auto-Reformat (LLM) -->
+                            <p class="vectfox-section-label" style="font-weight:600; margin-top:16px; margin-bottom:8px;">Auto-Reformat (LLM)</p>
+                            <small class="VectFox_hint" style="display:block; margin-bottom:8px;">
+                                Optional, per-item LLM pass offered in <b>Vectorize Content</b> for Document/URL/Wiki sources. Reads the source, splits it into clean per-entity/per-topic entries, and uses those as the final chunks — you review and accept every entry before anything is stored. Leave Provider/Model blank to inherit from <b>Summarize Before Store</b> settings.
+                            </small>
+
+                            <div class="vectfox-form-group">
+                                <label for="VectFox_reformat_provider"><small>Provider</small></label>
+                                <select id="VectFox_reformat_provider" class="vectfox-select">
+                                    <option value="">(Inherit from summarizer)</option>
+                                    <option value="openrouter">OpenRouter</option>
+                                    <option value="vllm">vLLM</option>
+                                </select>
+                            </div>
+
+                            <div class="vectfox-form-group">
+                                <label for="VectFox_reformat_model"><small>Model</small></label>
+                                <input type="text" id="VectFox_reformat_model" class="vectfox-input"
+                                    placeholder="(empty → inherit summarizer model)" />
+                            </div>
+
+                            <div class="vectfox-form-group" id="VectFox_reformat_vllm_row" style="display:none;">
+                                <label for="VectFox_reformat_vllm_url"><small>vLLM Base URL</small></label>
+                                <input type="text" id="VectFox_reformat_vllm_url" class="vectfox-input"
+                                    placeholder="(empty → inherit summarize URL)" />
+                                <small class="VectFox_hint">API key is shared with Embedding/Summarize/AgentMode — set it in Core → LLM Summarization.</small>
+                            </div>
+
+                            <label for="VectFox_reformat_batch_chars">
+                                <small>Batch Size: <span id="VectFox_reformat_batch_chars_val">6000</span> chars</small>
+                            </label>
+                            <input type="range" id="VectFox_reformat_batch_chars" class="vectfox-slider" min="2000" max="12000" step="500" />
+                            <small class="VectFox_hint">Target input size per LLM call. Long documents are split into multiple batches at header boundaries; lower this if a section is so dense the model truncates its output.</small>
+
+                            <label for="VectFox_reformat_max_body_chars" style="margin-top:10px; display:block;">
+                                <small>Max Entry Size: <span id="VectFox_reformat_max_body_chars_val">2000</span> chars</small>
+                            </label>
+                            <input type="range" id="VectFox_reformat_max_body_chars" class="vectfox-slider" min="500" max="5000" step="250" />
+                            <small class="VectFox_hint">Entries longer than this are sub-chunked with the same adaptive splitter used elsewhere, so one oversized entity doesn't become one giant chunk.</small>
+
+                            <label for="VectFox_reformat_name_fuzzy_threshold" style="margin-top:10px; display:block;">
+                                <small>Hallucination Guard Sensitivity: <span id="VectFox_reformat_name_fuzzy_threshold_val">0.8</span></small>
+                            </label>
+                            <input type="range" id="VectFox_reformat_name_fuzzy_threshold" class="vectfox-slider" min="0.5" max="1" step="0.05" />
+                            <small class="VectFox_hint">Minimum name-match confidence before the review screen flags an entry as possibly invented by the model. Higher = stricter (more flags, some false positives on close paraphrases).</small>
+
+                            <label for="VectFox_reformat_concurrency" style="margin-top:10px; display:block;">
+                                <small>Parallel Batches: <span id="VectFox_reformat_concurrency_val">2</span></small>
+                            </label>
+                            <input type="range" id="VectFox_reformat_concurrency" class="vectfox-slider" min="1" max="6" step="1" />
+                            <small class="VectFox_hint">How many LLM calls run at once when a document needs multiple batches.</small>
+
+                            <label for="VectFox_reformat_timeout_ms" style="margin-top:10px; display:block;">
+                                <small>Timeout (ms)</small>
+                            </label>
+                            <input id="VectFox_reformat_timeout_ms" type="number" class="vectfox-input" min="10000" step="1000" style="width:140px;" />
+
+                            <label for="VectFox_reformat_custom_prompt" style="margin-top:10px; display:block;">
+                                <small>Custom Extraction Prompt (advanced)</small>
+                            </label>
+                            <textarea id="VectFox_reformat_custom_prompt" class="vectfox-input" rows="3"
+                                placeholder="Leave blank to use the built-in prompt. Must instruct the model to output a JSON array with entry_type/name/aliases/affiliation/traits/relationships/keywords/body fields."
+                                style="margin-top:4px;"></textarea>
+
                             <!-- Query (ChunkBase-only) -->
                             <p class="vectfox-section-label" style="font-weight:600; margin-top:16px; margin-bottom:8px;">Query</p>
                             <div style="margin-top:4px; display:flex; gap:8px; align-items:center;">
@@ -808,7 +959,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                     Auto-sync window: <span id="VectFox_eventbase_autosync_window_turns_val">1</span> turn(s)
                                     <span class="VectFox_hint" id="VectFox_autosync_window_msg_equiv" style="margin-left:4px;">(= 2 messages)</span>
                                 </label>
-                                <input type="range" id="VectFox_eventbase_autosync_window_turns" min="1" max="20" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_eventbase_autosync_window_turns" min="1" max="20" step="1" class="vectfox-slider" />
                                 <small class="VectFox_hint">Independent of the EventBase "Window Size". 1 turn = 2 messages (1 user + 1 AI reply). Auto-sync extracts a window every this-many turns of new chat.</small>
                             </div>
 
@@ -829,7 +980,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                 <small class="VectFox_hint">Inject the most recent N EventBase summaries into the prompt every turn (wrapped in &lt;VectFoxSummarizer&gt; tags), in addition to semantic retrieval. Enables word-for-word-ish memory of the last few turns. <strong>Turns on auto-sync and forces its window to 1 turn while on</strong> (so the latest reply is always extracted before the next injection).</small>
                                 <div class="vectfox-form-group" id="VectFox_summarizer_injection_count_group" style="margin-top: 8px;">
                                     <label class="vectfox-label">Inject last <span id="VectFox_summarizer_injection_count_val">20</span> turn(s)</label>
-                                    <input type="range" id="VectFox_summarizer_injection_count" min="1" max="50" step="1" class="vectfox-range" />
+                                    <input type="range" id="VectFox_summarizer_injection_count" min="1" max="50" step="1" class="vectfox-slider" />
                                 </div>
                                 <label class="checkbox_label" for="VectFox_summarizer_injection_full_detail" style="margin-top: 8px;">
                                     <input type="checkbox" id="VectFox_summarizer_injection_full_detail" />
@@ -839,6 +990,21 @@ export function renderSettings(containerId, settings, callbacks) {
                                 <label for="VectFox_summarizer_injection_max_chars" style="margin-top: 8px; display:block;"><small>Max injection size (characters, 0 = no cap)</small></label>
                                 <input type="number" id="VectFox_summarizer_injection_max_chars" class="vectfox-input" min="0" max="100000" step="500" />
                                 <small class="VectFox_hint">Safety cap on the whole &lt;VectFoxSummarizer&gt; block. If the events exceed it, the OLDEST are dropped (newest always kept) — prevents a huge injection from overflowing the model's context.</small>
+
+                                <!-- Ghosting: wipe oldest N vectorized messages from the OUTGOING prompt only. -->
+                                <div class="vectfox-form-group" id="VectFox_eventbase_ghost_group" style="margin-top: 12px; border-top: 1px dashed var(--SmartThemeBorderColor); padding-top: 10px;">
+                                    <label class="checkbox_label" for="VectFox_eventbase_ghost_enabled">
+                                        <input type="checkbox" id="VectFox_eventbase_ghost_enabled" />
+                                        <span>Ghost vectorized messages (token saver)</span>
+                                    </label>
+                                    <small class="VectFox_hint">Keep the most recent messages raw and blank ALL older already-vectorized messages from the prompt sent to the AI. The chat UI and saved file are <strong>untouched</strong>, and it resets every turn. The wiped turns rely on EventBase memory (the injection above + semantic retrieval) instead of their raw text — so check your recall quality as you <strong>lower</strong> the slider. Scales to any chat length. Requires Summarizer Injection.</small>
+                                    <div class="vectfox-form-group" id="VectFox_eventbase_ghost_keep_recent_group" style="margin-top: 8px;">
+                                        <label class="vectfox-label">Keep last <span id="VectFox_eventbase_ghost_keep_recent_val">10</span> message(s) verbatim</label>
+                                        <input type="range" id="VectFox_eventbase_ghost_keep_recent" min="0" max="100" step="1" class="vectfox-slider" />
+                                        <small class="VectFox_hint">Everything older than this that's been vectorized is wiped (never the recent un-synced tail). Lower = more aggressive (more tokens saved). Even at <strong>0</strong>, ghosting always keeps the current turn and your World Info scan window verbatim — so it never breaks keyword triggers and never sends an empty prompt. "<strong>0</strong>" means "wipe as much as is safe," not literally everything.</small>
+                                    </div>
+                                    <div id="VectFox_eventbase_ghost_readout" class="VectFox_hint" style="margin-top: 8px; display:block; padding: 6px 8px; border-radius: 6px; background: rgba(127,127,127,0.12);">Last turn: no generation yet.</div>
+                                </div>
                             </div>
 
                             <!-- Collection lock moved to Database Browser (per-collection settings) -->
@@ -993,13 +1159,13 @@ export function renderSettings(containerId, settings, callbacks) {
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Min Importance to Store <span id="VectFox_eventbase_min_importance_store_val">3</span></label>
-                                <input type="range" id="VectFox_eventbase_min_importance_store" min="1" max="10" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_eventbase_min_importance_store" min="1" max="10" step="1" class="vectfox-slider" />
                                 <small class="VectFox_hint">Events below this importance threshold are discarded before writing to Qdrant.</small>
                             </div>
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Max Events per Window <span id="VectFox_eventbase_max_events_per_window_val">3</span></label>
-                                <input type="range" id="VectFox_eventbase_max_events_per_window" min="1" max="10" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_eventbase_max_events_per_window" min="1" max="10" step="1" class="vectfox-slider" />
                                 <small class="VectFox_hint">Hard cap per LLM call. AI is instructed to return fewer (or zero) for filler / 日常 nichijou / non-narrative scenes.</small>
                             </div>
 
@@ -1010,12 +1176,24 @@ export function renderSettings(containerId, settings, callbacks) {
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Max Output Tokens</label>
-                                <input type="number" id="VectFox_eventbase_max_tokens" class="vectfox-input" min="256" max="8192" step="64" style="width:120px;" />
+                                <input type="number" id="VectFox_eventbase_max_tokens" class="vectfox-input" min="256" max="32768" step="64" style="width:120px;" />
+                                <small class="VectFox_hint">
+                                    Raise this if extraction fails with "used its entire token limit without
+                                    answering" — a thinking model spends this budget before it writes anything.
+                                </small>
                             </div>
 
                             <div class="vectfox-form-group">
-                                <label class="vectfox-label">Timeout (ms)</label>
+                                <p class="vectfox-section-label" style="margin-bottom:4px;"><strong>LLM Call Timeouts</strong></p>
+                                <small class="VectFox_hint" style="display:block; margin-bottom:8px;">
+                                    Two independent per-call timeouts, both on the same configured model. <strong>Extraction</strong> bounds each end-to-end EventBase extraction call (a window of messages in → finished structured events out). <strong>Summarization</strong> bounds each single "Summarize Before Store" call (one chunk in → its summary out). Raise either if a slow local model gets cut off.
+                                </small>
+
+                                <label class="vectfox-label">Extraction Timeout (ms)</label>
                                 <input type="number" id="VectFox_eventbase_timeout_ms" class="vectfox-input" min="5000" max="300000" step="1000" style="width:130px;" />
+
+                                <label class="vectfox-label" style="margin-top:8px;">Summarization Timeout (ms)</label>
+                                <input type="number" id="VectFox_summarize_timeout_ms" class="vectfox-input" min="5000" max="300000" step="1000" style="width:130px;" />
                             </div>
 
                             <div class="vectfox-form-group">
@@ -1033,12 +1211,12 @@ export function renderSettings(containerId, settings, callbacks) {
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Retrieve Top-K <span id="VectFox_eventbase_retrieval_top_k_val">10</span></label>
-                                <input type="range" id="VectFox_eventbase_retrieval_top_k" min="1" max="32" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_eventbase_retrieval_top_k" min="1" max="32" step="1" class="vectfox-slider" />
                             </div>
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Min Importance for Retrieval <span id="VectFox_eventbase_retrieval_min_importance_val">1</span></label>
-                                <input type="range" id="VectFox_eventbase_retrieval_min_importance" min="1" max="10" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_eventbase_retrieval_min_importance" min="1" max="10" step="1" class="vectfox-slider" />
                             </div>
 
                             <div class="vectfox-form-group">
@@ -1147,6 +1325,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                 <label for="VectFox_agentic_openrouter_apikey"><small>OpenRouter API Key</small></label>
                                 <input type="password" id="VectFox_agentic_openrouter_apikey" class="vectfox-input"
                                     placeholder="(empty → inherit summarize key)" autocomplete="off" />
+                                <button type="button" id="VectFox_agentic_openrouter_apikey_clear" class="menu_button" style="margin-top:4px; width:auto; white-space:nowrap;"><i class="fa-solid fa-trash-can"></i> Clear saved key</button>
                             </div>
 
                             <div class="vectfox-form-group" id="VectFox_agentic_vllm_row" style="display:none;">
@@ -1156,6 +1335,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                 <label for="VectFox_agentic_vllm_apikey" style="margin-top:8px;"><small>vLLM API Key</small></label>
                                 <input type="password" id="VectFox_agentic_vllm_apikey" class="vectfox-input"
                                     placeholder="(empty → inherit summarize key)" autocomplete="off" />
+                                <button type="button" id="VectFox_agentic_vllm_apikey_clear" class="menu_button" style="margin-top:4px; width:auto; white-space:nowrap;"><i class="fa-solid fa-trash-can"></i> Clear saved key</button>
                             </div>
 
                             <!-- Retrieval Tuning -->
@@ -1163,32 +1343,38 @@ export function renderSettings(containerId, settings, callbacks) {
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Past chat turns sent to planner: <span id="VectFox_agentic_chat_depth_val">3</span></label>
-                                <input type="range" id="VectFox_agentic_chat_depth" min="1" max="10" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_agentic_chat_depth" min="1" max="10" step="1" class="vectfox-slider" />
                                 <small class="VectFox_hint">How many recent non-system chat turns are included as narrative context for the planner. Lower = faster + cheaper LLM call; higher = more story context for the planner to reason about.</small>
                             </div>
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Candidates shown to planner: <span id="VectFox_agentic_candidates_val">12</span></label>
-                                <input type="range" id="VectFox_agentic_candidates" min="5" max="20" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_agentic_candidates" min="5" max="20" step="1" class="vectfox-slider" />
                                 <small class="VectFox_hint">How many top pre-search events the planner sees when deciding what extra queries to run.</small>
                             </div>
 
                             <div class="vectfox-form-group">
                                 <label class="vectfox-label">Max planner queries: <span id="VectFox_agentic_max_queries_val">6</span></label>
-                                <input type="range" id="VectFox_agentic_max_queries" min="1" max="6" step="1" class="vectfox-range" />
+                                <input type="range" id="VectFox_agentic_max_queries" min="1" max="6" step="1" class="vectfox-slider" />
                                 <small class="VectFox_hint">Hard ceiling on how many follow-up queries the planner can emit. Each query is one Qdrant call per live collection.</small>
                             </div>
 
                             <div class="vectfox-form-group">
                                 <label for="VectFox_agentic_timeout"><small>Planner LLM Timeout (ms)</small></label>
-                                <input type="number" id="VectFox_agentic_timeout" class="vectfox-input" min="1000" max="60000" step="1000" />
-                                <small class="VectFox_hint">Hard timeout for the planner call. Default <b>30000 ms (30s)</b>. On timeout, agent mode falls back to pre-search only. Increase if your planner model is slow (large models / free-tier providers often take 10-20s on a 1500-token prompt).</small>
+                                <input type="number" id="VectFox_agentic_timeout" class="vectfox-input" min="${AGENTIC_TIMEOUT_MIN_MS}" max="${AGENTIC_TIMEOUT_MAX_MS}" step="1000" />
+                                <small class="VectFox_hint">Hard timeout for the planner call. Default <b>${AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS} ms (${AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS / 1000}s)</b>. On timeout, agent mode falls back to pre-search only. Increase if your planner model is slow (large models / free-tier providers often take 10-20s on a 1500-token prompt). This time is <b>added to</b> "Retrieval Timeout" on the Core tab for the EventBase lookup, so raising it here is not capped by that setting.</small>
+                            </div>
+
+                            <div class="vectfox-form-group">
+                                <label for="VectFox_agentic_max_tokens"><small>Planner Max Output Tokens</small></label>
+                                <input type="number" id="VectFox_agentic_max_tokens" class="vectfox-input" min="${AGENTIC_MAX_TOKENS_MIN}" max="${AGENTIC_MAX_TOKENS_MAX}" step="256" />
+                                <small class="VectFox_hint">Output-token cap for the planner call. Default <b>${AGENTIC_MAX_TOKENS_DEFAULT}</b>, range ${AGENTIC_MAX_TOKENS_MIN}–${AGENTIC_MAX_TOKENS_MAX}. The planner only returns a short JSON object, so the default is ample for a model that answers directly. <b>Raise it if your planner model reasons</b> — thinking tokens are charged against this same cap, so a reasoning model can spend the whole budget before writing any JSON, and agent mode then falls back to pre-search. "Disable thinking" on the Core tab only <i>asks</i> the model not to reason; many models ignore it.</small>
                             </div>
 
                             <div class="vectfox-form-group">
                                 <label for="VectFox_agentic_query_timeout"><small>Per-query Timeout (ms)</small></label>
-                                <input type="number" id="VectFox_agentic_query_timeout" class="vectfox-input" min="1000" max="60000" step="1000" />
-                                <small class="VectFox_hint">Hard timeout for each parallel fanout query. Default <b>10000 ms (10s)</b>. Queries run in parallel, so the turn waits on the slowest one — this drops a straggling query (e.g. an embedding-provider latency spike) so a single slow call can't stall retrieval. The remaining queries still count.</small>
+                                <input type="number" id="VectFox_agentic_query_timeout" class="vectfox-input" min="${AGENTIC_TIMEOUT_MIN_MS}" max="${AGENTIC_TIMEOUT_MAX_MS}" step="1000" />
+                                <small class="VectFox_hint">Hard timeout for each parallel fanout query. Default <b>${AGENTIC_QUERY_TIMEOUT_DEFAULT_MS} ms (${AGENTIC_QUERY_TIMEOUT_DEFAULT_MS / 1000}s)</b>. Queries run in parallel, so the turn waits on the slowest one — this drops a straggling query (e.g. an embedding-provider latency spike) so a single slow call can't stall retrieval. The remaining queries still count. Like the planner timeout above, this is <b>added to</b> "Retrieval Timeout" on the Core tab rather than capped by it.</small>
                             </div>
 
                             <!-- Apply planner filters (Phase 1.5) -->
@@ -1846,7 +2032,7 @@ export async function refreshAutoSyncCheckbox(settings) {
     const $hint = $('#VectFox_autosync_hint');
 
     const { getChatAutoSyncStatus } = await import('../core/eventbase-workflow.js');
-    const { isCollectionAutoSyncEnabled, isCollectionLockedToChat } = await import('../core/collection-metadata.js');
+    const { isCollectionAutoSyncEnabled, isCollectionActiveForContextAnyKey } = await import('../core/collection-metadata.js');
 
     const status = await getChatAutoSyncStatus(settings);
     const chatId = getCurrentChatId();
@@ -1878,7 +2064,8 @@ export async function refreshAutoSyncCheckbox(settings) {
     // Metadata is keyed by registry-key form ("backend:id").
     const lookupKey = status.registryKey || status.collectionId;
     const isEnabled = isCollectionAutoSyncEnabled(lookupKey);
-    const isLocked = chatId && isCollectionLockedToChat(lookupKey, chatId);
+    const isLocked = chatId && isCollectionActiveForContextAnyKey(
+        [status.registryKey, status.collectionId], { chatId });
     $checkbox.prop('checked', Boolean(isEnabled && isLocked));
     $hint.hide();
 
@@ -1890,9 +2077,18 @@ export async function refreshAutoSyncCheckbox(settings) {
     const vectorizedCount = (typeof status.vectorizationTip === 'number')
         ? status.vectorizationTip
         : (typeof status.markerValue === 'number' ? status.markerValue : null);
+    // Settle/commit lag: when fully synced, the active last turn is intentionally
+    // held back (it's already in live context), so "vectorization" can sit one
+    // turn behind "chat" without being a backlog. Label that gap so green + a
+    // small delta reads as intentional, not "behind". See plans/autosync-settle-lag.md.
+    const settleGap = (typeof status.chatMessageCount === 'number' && vectorizedCount !== null)
+        ? status.chatMessageCount - vectorizedCount
+        : 0;
+    const showSettleNote = status.state === 'fully-vectorized' && settleGap > 0;
     const counts = (typeof status.chatMessageCount === 'number')
         ? `<div style="margin-top:4px;font-size:0.85em;opacity:0.8;">chat: ${status.chatMessageCount} msgs` +
           (vectorizedCount !== null ? ` · vectorization: ${vectorizedCount} msgs` : '') +
+          (showSettleNote ? ` · latest turn pending settle` : '') +
           `</div>`
         : '';
 
@@ -2113,7 +2309,7 @@ async function showAutoSyncConfirmModal(allMatches, settings) {
                 // Use unified delete function - handles vectors, registry, AND metadata
                 const deleteSettings = {
                     ...settings,
-                    source: ghost.source || settings.source,
+                    source: ghost.source || settings.embedding_provider,
                 };
                 const result = await deleteCollection(ghost.collectionId, deleteSettings, ghost.registryKey);
 
@@ -2182,6 +2378,47 @@ async function showAutoSyncConfirmModal(allMatches, settings) {
 }
 
 /**
+ * Delete a shared VectFox API key from ST's secret store and refresh every input that
+ * displays it. ONE implementation reused by all "Clear saved key" buttons (Embedding /
+ * Summarization / AgentMode, OpenRouter + vLLM) so the delete + refresh logic never drifts.
+ *
+ * Deletes the ACTIVE entry in each slot (the masked key the UI shows); vLLM/Custom keys live
+ * in two slots (CUSTOM for chat-side, VLLM for embedding-side) so both are cleared. The
+ * placeholder refresh rides the existing `vectfox:*-key-changed` document events that every
+ * placeholder updater already listens to — so all three places re-render from one trigger.
+ *
+ * @param {{ slots: string[], changedEvent: string, label: string, getCurrent: () => string, sharedWithST?: boolean }} opts
+ */
+async function clearSharedApiKey({ slots, changedEvent, label, getCurrent, sharedWithST = false }) {
+    if (typeof getCurrent === 'function' && !getCurrent()) {
+        toastr.info(`No ${label} API key is saved.`);
+        return;
+    }
+    const warn = sharedWithST
+        ? `\n\nThis is the same secret slot SillyTavern itself uses, so deleting it also affects your main chat if that's set to ${label}.`
+        : '';
+    if (!confirm(`Delete the saved ${label} API key?\n\nIt is shared across Embedding, Summarization, and AgentMode.${warn}\n\nThis cannot be undone.`)) {
+        return;
+    }
+    const failed = [];
+    for (const slot of slots) {
+        try {
+            await deleteSecret(slot); // no id → removes the active entry; clears the slot if it was the last
+        } catch (err) {
+            log.error(`[VectFox] deleteSecret(${slot}) failed:`, err);
+            failed.push(slot);
+        }
+    }
+    try { await readSecretState(); } catch { /* deleteSecret already refreshes secret_state */ }
+    $(document).trigger(changedEvent); // every placeholder updater re-renders from this
+    if (failed.length) {
+        toastr.error(`Failed to delete ${label} key — see console.`);
+    } else {
+        toastr.info(`${label} API key deleted.`);
+    }
+}
+
+/**
  * Binds event handlers to UI elements
  * @param {object} settings - VectFox settings object
  * @param {object} callbacks - Callback functions
@@ -2196,6 +2433,80 @@ function bindSettingsEvents(settings, callbacks) {
     // Injection group on standard+no-plugin (its listChunks returns no metadata).
     let _refreshSummarizerInjectionAvailability = null;
 
+    // Master switch — global enable/disable. Default ON (only false disables);
+    // mirrors core/feature-gate.js::isVectFoxEnabled so the UI and the runtime
+    // gates agree. Dims the rest of the panel when off as a visual cue.
+    const $masterSwitch = $('#VectFox_master_enabled');
+    const _applyMasterSwitchUI = (on) => {
+        $('#VectFox_settings .vectfox-tabs, #VectFox_settings .vectfox-card')
+            .css({ opacity: on ? '' : '0.5' });
+    };
+    $masterSwitch
+        .prop('checked', settings.enabled !== false)
+        .on('change', async function() {
+            const on = $(this).prop('checked');
+            settings.enabled = on;
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+            _applyMasterSwitchUI(on);
+            toastr.info(on ? 'VectFox enabled' : 'VectFox disabled', 'VectFox');
+            log.lifecycle(`VectFox: master switch ${on ? 'ON' : 'OFF'}`);
+
+            // A disabled VectFox skips its off-box startup work at page load. Two of
+            // those steps don't self-heal on demand — the EventBase payload-index
+            // backfill is one-shot-per-install, and collection discovery refreshes the
+            // registry that the Database Browser and cross-chat retrieval read. Run
+            // them now so switching back ON gives a working VectFox without a page
+            // reload. See core/network-startup.js for the full rationale.
+            if (on) {
+                try {
+                    await runNetworkStartup(settings);
+                } catch (error) {
+                    log.warn('VectFox: backend/network startup after re-enable failed:', error?.message || error);
+                }
+            }
+        });
+    _applyMasterSwitchUI(settings.enabled !== false);
+
+    /**
+     * Turn Summarizer Injection off, because auto-sync — its data source — is not
+     * running. Without auto-sync the collection stops tracking the chat, so
+     * "the most recent N events" silently becomes some older N: the injection
+     * keeps firing and feeds the model information that is simply wrong. Off is
+     * the only safe state.
+     *
+     * Called from every path that leaves auto-sync off, including the two that
+     * REFUSE to turn it on (no chat / no collection). Those return early, so
+     * they used to skip the disable branch below — which is how the summarizer
+     * could sit checked next to an unchecked auto-sync.
+     *
+     * @param {string} reason - shown to the user, completing "Summarizer Injection disabled (…)"
+     */
+    /**
+     * Chat id whose auto-sync the user asked to turn on, but which had no
+     * collection yet — so they were sent to Vectorize Content first. Consumed
+     * when that vectorization succeeds, cleared if they close the panel instead.
+     *
+     * Needed because the redirect is where the user's intent would otherwise be
+     * lost: they ticked the box, got taken somewhere else, finished the work the
+     * box required, and came back to it still unticked.
+     *
+     * Chat-scoped so an intent from one chat can never enable auto-sync on
+     * another; null when nothing is pending.
+     * @type {string|null}
+     */
+    let _autoSyncEnableAwaitingVectorizeForChat = null;
+
+    const _disableSummarizerInjectionBecauseAutoSyncIsOff = (reason) => {
+        if (!settings.summarizer_injection_enabled) return;
+        settings.summarizer_injection_enabled = false;
+        Object.assign(extension_settings.vectfox, settings);
+        saveSettingsDebounced();
+        $('#VectFox_summarizer_injection_enabled').prop('checked', false);
+        _applySummarizerLock();
+        toastr.info(`Summarizer Injection disabled (${reason})`);
+    };
+
     // Auto-sync enable/disable - now per-collection instead of global
     // Initial state is set by refreshAutoSyncCheckbox() after chat loads
     $('#VectFox_autosync_enabled')
@@ -2204,13 +2515,15 @@ function bindSettingsEvents(settings, callbacks) {
             const $checkbox = $(this);
 
             const { getChatAutoSyncStatus } = await import('../core/eventbase-workflow.js');
-            const { setCollectionAutoSync, setCollectionLock, removeCollectionLock } = await import('../core/collection-metadata.js');
+            const { setCollectionAutoSync, setCollectionLock } = await import('../core/collection-metadata.js');
             const status = await getChatAutoSyncStatus(settings);
             const chatId = getCurrentChatId();
+            log.lifecycle(`[AutoSync][checkbox] ${enabling ? 'CHECK' : 'UNCHECK'} → status.state=${status.state}, chatId=${chatId || '(none)'}, collection=${status.registryKey || status.collectionId || '(none)'}`);
 
             if (status.state === 'no-chat') {
                 toastr.warning('Open a chat first before enabling auto-sync');
                 $checkbox.prop('checked', false);
+                _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync');
                 await refreshAutoSyncCheckbox(settings);
                 return;
             }
@@ -2218,8 +2531,13 @@ function bindSettingsEvents(settings, callbacks) {
             if (enabling) {
                 if (status.state === 'no-collection') {
                     // No collection for this chat yet — send the user to vectorize first.
+                    log.lifecycle('[AutoSync][checkbox] state=no-collection → redirecting to Vectorize Content (resolveActiveEventBaseCollection found no eligible collection — see [EventBase][resolve] log above)');
                     $checkbox.prop('checked', false);
-                    toastr.info('Vectorize your chat history first');
+                    toastr.info('Vectorize your chat history first — auto-sync will turn on when it finishes');
+                    _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync, which needs a vectorized chat');
+                    // Remember the intent across the redirect so a finished
+                    // vectorization resumes the enable the user actually asked for.
+                    _autoSyncEnableAwaitingVectorizeForChat = chatId;
                     openContentVectorizer('chat');
                     return;
                 }
@@ -2245,7 +2563,11 @@ function bindSettingsEvents(settings, callbacks) {
                         : (getContext()?.chat || []).filter(m => m.mes && m.mes.trim().length > 0).length;
                     const tip = getVectorizationTip(uuid) ?? 0;
                     const windowSize = Math.max(1, getAutoSyncWindowSize(settings));
-                    const pendingMsgs = Math.max(0, chatMsgCount - tip);
+                    // Clamp the backlog to the commit boundary — the active last turn is
+                    // held back by the settle-lag and settles on its own, so it isn't
+                    // "pending backlog". See plans/autosync-settle-lag.md.
+                    const boundary = typeof status.commitBoundary === 'number' ? status.commitBoundary : chatMsgCount;
+                    const pendingMsgs = Math.max(0, boundary - tip);
                     const pendingWindows = Math.floor(pendingMsgs / windowSize);
                     const CATCHUP_PROMPT_THRESHOLD = 5; // windows (~5 LLM calls)
 
@@ -2274,6 +2596,7 @@ function bindSettingsEvents(settings, callbacks) {
                         } else {
                             // X / Esc — abort enabling entirely.
                             $checkbox.prop('checked', false);
+                            _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync');
                             await refreshAutoSyncCheckbox(settings);
                             return;
                         }
@@ -2309,25 +2632,19 @@ function bindSettingsEvents(settings, callbacks) {
                 toastr.success(message);
                 log.lifecycle(`VectFox: Chat auto-sync ENABLED for ${lockKey} (state=${status.state})`);
             } else {
-                // Auto-sync is the summarizer's data source — once it's off, "most recent
-                // N events" goes stale, so disabling auto-sync also disables the summarizer
-                // to keep the two consistent (reverse of the forward bind in the summarizer
-                // checkbox handler). Set the flag + checkbox directly and release the window
-                // lock; the injection self-clears on its next (now-disabled) turn.
-                if (settings.summarizer_injection_enabled) {
-                    settings.summarizer_injection_enabled = false;
-                    Object.assign(extension_settings.vectfox, settings);
-                    saveSettingsDebounced();
-                    $('#VectFox_summarizer_injection_enabled').prop('checked', false);
-                    _applySummarizerLock();
-                    toastr.info('Summarizer Injection disabled (needs auto-sync)');
-                }
+                // Reverse of the forward bind in the summarizer checkbox handler; the
+                // injection self-clears on its next (now-disabled) turn.
+                _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync');
 
-                // Uncheck — clear the flag and release the chat lock.
+                // Uncheck — clear ONLY the auto-sync flag. Do NOT touch the chat
+                // lock: the lock is a separate concern (it marks the collection
+                // "active for this chat" for retrieval too, and the user may have
+                // set it deliberately via the DB Browser). Removing it here surprised
+                // users by deactivating a collection they only wanted to stop
+                // auto-syncing. Unlocking is the DB Browser's job, not this toggle's.
                 if (status.state !== 'no-collection') {
                     const lockKey = status.registryKey || status.collectionId;
                     setCollectionAutoSync(lockKey, false);
-                    if (chatId) removeCollectionLock(lockKey, chatId);
 
                     // Clear the marker so re-enabling later re-computes a fresh one
                     // against whatever collection state exists at that time.
@@ -2364,21 +2681,48 @@ function bindSettingsEvents(settings, callbacks) {
         $('#VectFox_summarize_vllm_url_row').toggle(provider === 'vllm');
     };
     $('#VectFox_summarize_provider')
-        .val(settings.summarize_provider || 'openrouter')
+        .val(settings.chat_provider || 'openrouter')
         .on('change', function() {
-            settings.summarize_provider = String($(this).val());
+            settings.chat_provider = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
-            updateSummarizeUI(settings.summarize_provider);
+            updateSummarizeUI(settings.chat_provider);
         });
-    updateSummarizeUI(settings.summarize_provider || 'openrouter');
+    updateSummarizeUI(settings.chat_provider || 'openrouter');
 
     $('#VectFox_summarize_model')
-        .val(settings.summarize_model || '')
+        .val(settings.chat_model || '')
         .on('input change', function() {
             // Bind 'input' too — 'change' alone only fires on blur, so clicking Vectorize
             // immediately after typing would skip the save.
-            settings.summarize_model = String($(this).val()).trim();
+            settings.chat_model = String($(this).val()).trim();
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    // Request-shape switches for reasoning models. Global on purpose — they
+    // describe the chat endpoint, not one feature, and every LLM path reads them
+    // through resolveModelParameterStyle(). See core/llm-provider-call.js.
+    $('#VectFox_should_send_temperature')
+        .prop('checked', settings.should_send_temperature !== false)
+        .on('change', function() {
+            settings.should_send_temperature = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    $('#VectFox_should_use_max_completion_tokens')
+        .prop('checked', settings.should_use_max_completion_tokens === true)
+        .on('change', function() {
+            settings.should_use_max_completion_tokens = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    $('#VectFox_should_disable_thinking')
+        .prop('checked', settings.should_disable_thinking !== false)
+        .on('change', function() {
+            settings.should_disable_thinking = $(this).prop('checked');
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -2388,7 +2732,7 @@ function bindSettingsEvents(settings, callbacks) {
         const $btn = $(this);
         const $list = $('#VectFox_summarize_model_list');
         const $input = $('#VectFox_summarize_model');
-        const provider = settings.summarize_provider || 'openrouter';
+        const provider = settings.chat_provider || 'openrouter';
 
         const originalHtml = $btn.html();
         $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Loading…');
@@ -2403,7 +2747,15 @@ function bindSettingsEvents(settings, callbacks) {
                 const data = await resp.json();
                 models = (data?.data || []).map(m => ({ id: m.id, label: m.name ? `${m.id} — ${m.name}` : m.id }));
             } else if (provider === 'vllm') {
-                const baseUrl = (settings.summarize_vllm_url || '').replace(/\/$/, '').replace(/\/v1$/, '');
+                // Send the URL verbatim (trailing slash trimmed only). ST's /status
+                // does urlJoin(custom_url, '/models'), appending '/models' to exactly
+                // what we pass — it does NOT re-insert a version segment. Stripping a
+                // trailing '/v1' here made ST call <host>/models instead of
+                // <host>/v1/models, breaking model listing on every standard
+                // OpenAI-compatible endpoint (vLLM, OpenRouter, etc.). The summarizer
+                // and embedding call sites already pass the user's '/v1' through; this
+                // matches them. See GitHub issue #8.
+                const baseUrl = (settings.chat_vllm_url || '').trim().replace(/\/+$/, '');
                 if (!baseUrl) {
                     toastr.error('Set the vLLM Base URL first.', 'vLLM not configured');
                     return;
@@ -2489,9 +2841,9 @@ function bindSettingsEvents(settings, callbacks) {
     });
 
     $('#VectFox_summarize_vllm_url')
-        .val(settings.summarize_vllm_url || '')
+        .val(settings.chat_vllm_url || '')
         .on('change', function() {
-            settings.summarize_vllm_url = String($(this).val()).trim();
+            settings.chat_vllm_url = String($(this).val()).trim();
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -2622,19 +2974,19 @@ function bindSettingsEvents(settings, callbacks) {
         });
 
     $('#VectFox_agentic_provider')
-        .val(settings.agentic_retrieval_provider || '')
+        .val(settings.agent_provider || '')
         .on('change', function() {
-            settings.agentic_retrieval_provider = String($(this).val());
+            settings.agent_provider = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
-            updateAgenticUI(settings.agentic_retrieval_provider);
+            updateAgenticUI(settings.agent_provider);
         });
-    updateAgenticUI(settings.agentic_retrieval_provider || '');
+    updateAgenticUI(settings.agent_provider || '');
 
     $('#VectFox_agentic_model')
-        .val(settings.agentic_retrieval_model || '')
+        .val(settings.agent_model || '')
         .on('input change', function() {
-            settings.agentic_retrieval_model = String($(this).val()).trim();
+            settings.agent_model = String($(this).val()).trim();
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -2674,9 +3026,9 @@ function bindSettingsEvents(settings, callbacks) {
     });
 
     $('#VectFox_agentic_vllm_url')
-        .val(settings.agentic_retrieval_vllm_url || '')
+        .val(settings.agent_vllm_url || '')
         .on('change', function() {
-            settings.agentic_retrieval_vllm_url = String($(this).val()).trim();
+            settings.agent_vllm_url = String($(this).val()).trim();
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -2730,6 +3082,28 @@ function bindSettingsEvents(settings, callbacks) {
         }
     });
 
+    // "Clear saved key" buttons — all 6 (Embedding / Summarize / AgentMode × OpenRouter / vLLM)
+    // funnel through the single clearSharedApiKey() helper so the delete + refresh never drifts.
+    // OpenRouter keys share one slot; vLLM/Custom keys live in CUSTOM + VLLM (both cleared).
+    const _openRouterClearOpts = {
+        slots: [SECRET_KEYS.OPENROUTER],
+        changedEvent: 'vectfox:openrouter-key-changed',
+        label: 'OpenRouter',
+        getCurrent: () => getOpenRouterApiKey(settings),
+        sharedWithST: true,
+    };
+    const _vllmClearOpts = {
+        slots: [SECRET_KEYS.CUSTOM, SECRET_KEYS.VLLM],
+        changedEvent: 'vectfox:vllm-key-changed',
+        label: 'vLLM',
+        getCurrent: () => getCustomApiKey(settings),
+        sharedWithST: true,
+    };
+    ['#VectFox_openrouter_apikey_clear', '#VectFox_summarize_openrouter_apikey_clear', '#VectFox_agentic_openrouter_apikey_clear']
+        .forEach(sel => $(sel).on('click', () => clearSharedApiKey(_openRouterClearOpts)));
+    ['#VectFox_vllm_api_key_clear', '#VectFox_summarize_vllm_apikey_clear', '#VectFox_agentic_vllm_apikey_clear']
+        .forEach(sel => $(sel).on('click', () => clearSharedApiKey(_vllmClearOpts)));
+
     // Sliders — chat depth, candidates, max queries
     const bindAgenticSlider = (inputId, valSpanId, settingKey, defaultVal) => {
         const startVal = Number(settings[settingKey] ?? defaultVal);
@@ -2747,20 +3121,28 @@ function bindSettingsEvents(settings, callbacks) {
     bindAgenticSlider('#VectFox_agentic_candidates', '#VectFox_agentic_candidates_val', 'agentic_retrieval_candidates_to_show', 12);
     bindAgenticSlider('#VectFox_agentic_max_queries', '#VectFox_agentic_max_queries_val', 'agentic_retrieval_max_queries', 6);
 
+    // Both clamp through the same resolvers the retrieval path uses, so what the
+    // field accepts and what the budget honors can never drift apart.
     $('#VectFox_agentic_timeout')
-        .val(Number(settings.agentic_retrieval_timeout_ms ?? 30000))
+        .val(resolveAgenticPlannerTimeoutMs(settings))
         .on('change input', function() {
-            const v = Number($(this).val());
-            settings.agentic_retrieval_timeout_ms = Math.max(1000, Math.min(60000, v || 30000));
+            settings.agentic_retrieval_timeout_ms = resolveAgenticPlannerTimeoutMs({ agentic_retrieval_timeout_ms: $(this).val() });
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
 
     $('#VectFox_agentic_query_timeout')
-        .val(Number(settings.agentic_retrieval_query_timeout_ms ?? 10000))
+        .val(resolveAgenticQueryTimeoutMs(settings))
         .on('change input', function() {
-            const v = Number($(this).val());
-            settings.agentic_retrieval_query_timeout_ms = Math.max(1000, Math.min(60000, v || 10000));
+            settings.agentic_retrieval_query_timeout_ms = resolveAgenticQueryTimeoutMs({ agentic_retrieval_query_timeout_ms: $(this).val() });
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    $('#VectFox_agentic_max_tokens')
+        .val(resolveAgenticMaxTokens(settings))
+        .on('change input', function() {
+            settings.agentic_retrieval_max_tokens = resolveAgenticMaxTokens({ agentic_retrieval_max_tokens: $(this).val() });
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -2778,6 +3160,74 @@ function bindSettingsEvents(settings, callbacks) {
         .prop('checked', settings.agentic_filters_enabled !== false)
         .on('change', function() {
             settings.agentic_filters_enabled = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    // ─── Auto-Reformat (Document/URL/Wiki LLM restructuring) ───────────────
+    // Mirrors the AgentMode inherit-from-summarizer pattern above. No dedicated
+    // API-key fields — reuses the same shared OpenRouter/vLLM key slots.
+    const updateReformatProviderUI = (provider) => {
+        const resolved = String(provider || '').trim();
+        $('#VectFox_reformat_vllm_row').toggle(resolved === 'vllm');
+    };
+
+    $('#VectFox_reformat_provider')
+        .val(settings.reformat_provider || '')
+        .on('change', function() {
+            settings.reformat_provider = String($(this).val());
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+            updateReformatProviderUI(settings.reformat_provider);
+        });
+    updateReformatProviderUI(settings.reformat_provider || '');
+
+    $('#VectFox_reformat_model')
+        .val(settings.reformat_model || '')
+        .on('input change', function() {
+            settings.reformat_model = String($(this).val()).trim();
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    $('#VectFox_reformat_vllm_url')
+        .val(settings.reformat_vllm_url || '')
+        .on('change', function() {
+            settings.reformat_vllm_url = String($(this).val()).trim();
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    const bindReformatSlider = (inputId, valSpanId, settingKey, defaultVal) => {
+        const startVal = Number(settings[settingKey] ?? defaultVal);
+        $(inputId).val(startVal);
+        $(valSpanId).text(startVal);
+        $(inputId).on('input', function() {
+            const v = Number($(this).val());
+            settings[settingKey] = v;
+            $(valSpanId).text(v);
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+    };
+    bindReformatSlider('#VectFox_reformat_batch_chars', '#VectFox_reformat_batch_chars_val', 'reformat_batch_chars', 6000);
+    bindReformatSlider('#VectFox_reformat_max_body_chars', '#VectFox_reformat_max_body_chars_val', 'reformat_max_body_chars', 2000);
+    bindReformatSlider('#VectFox_reformat_name_fuzzy_threshold', '#VectFox_reformat_name_fuzzy_threshold_val', 'reformat_name_fuzzy_threshold', 0.8);
+    bindReformatSlider('#VectFox_reformat_concurrency', '#VectFox_reformat_concurrency_val', 'reformat_concurrency', 2);
+
+    $('#VectFox_reformat_timeout_ms')
+        .val(Number(settings.reformat_timeout_ms ?? 90000))
+        .on('change input', function() {
+            const v = Number($(this).val());
+            settings.reformat_timeout_ms = Math.max(10000, v || 90000);
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    $('#VectFox_reformat_custom_prompt')
+        .val(settings.reformat_custom_prompt || '')
+        .on('change', function() {
+            settings.reformat_custom_prompt = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -2843,10 +3293,57 @@ function bindSettingsEvents(settings, callbacks) {
         saveSettingsDebounced();
     }
 
+    // Helper: gate the Qdrant backend on the Similharity server plugin being
+    // installed. Qdrant depends entirely on the plugin's /api/plugins/similharity/...
+    // endpoints (and selecting it is what lets a qdrant_api_key get written into
+    // extension settings), so when the plugin is absent we must prevent the user
+    // from landing on Qdrant at all. Standard backend can fall back to ST's
+    // native Vectors extension, but Qdrant cannot run without the plugin.
+    //
+    // Enforcement (called on init and after every dropdown change):
+    //   1. Disable the <option value="qdrant"> so it can't be picked while the
+    //      plugin is missing.
+    //   2. If the current selection IS qdrant but the plugin is missing, revert
+    //      to standard, persist it, and re-sync the dependent UI.
+    //   3. Show/hide the red plugin-missing hint accordingly.
+    // Returns true if it forced a revert (caller may need to re-run side effects).
+    async function _refreshQdrantPluginAvailability() {
+        const $err = $('#VectFox_qdrant_plugin_error');
+        const pluginUp = await checkPluginAvailable();
+
+        // 1. Bar selecting Qdrant up front when the plugin is absent.
+        $('#VectFox_vector_backend option[value="qdrant"]').prop('disabled', !pluginUp);
+
+        // Persistent "why is Qdrant disabled?" notice (with install link) —
+        // visible whenever the plugin is missing, regardless of current backend.
+        $('#VectFox_qdrant_plugin_notice').toggle(!pluginUp);
+
+        const backend = settings.vector_backend || 'standard';
+        const mustRevert = backend === 'qdrant' && !pluginUp;
+
+        // 3. Red hint visible only while we're (briefly) on qdrant without a plugin.
+        if ($err.length) $err.toggle(mustRevert);
+
+        // 2. Force the selection back to Standard.
+        if (mustRevert) {
+            settings.vector_backend = 'standard';
+            $('#VectFox_vector_backend').val('standard');
+            $('#VectFox_qdrant_settings').hide();
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+            toastr.error(
+                'Qdrant requires the Similharity server plugin, which is not installed. Switched back to Standard (ST Vectra). Install the plugin to use Qdrant.',
+                'VectFox — Qdrant unavailable',
+                { timeOut: 8000 }
+            );
+        }
+        return mustRevert;
+    }
+
     // Vector backend selection
     $('#VectFox_vector_backend')
         .val(settings.vector_backend || 'qdrant')
-        .on('change', function() {
+        .on('change', async function() {
             settings.vector_backend = String($(this).val());
 
             // Show/hide Qdrant settings
@@ -2855,6 +3352,12 @@ function bindSettingsEvents(settings, callbacks) {
             } else {
                 $('#VectFox_qdrant_settings').hide();
             }
+
+            // Bar Qdrant when the plugin is missing: this shows a red alert and
+            // reverts settings.vector_backend to 'standard' in place. Await it so
+            // the dependent UI below syncs to the *effective* backend, not the
+            // one the user briefly clicked.
+            await _refreshQdrantPluginAvailability();
 
             // NOTE: standard backend is now safe to use with hedge, parallel-split,
             // and pipelined mode all enabled. The per-collection write queue in
@@ -2881,7 +3384,20 @@ function bindSettingsEvents(settings, callbacks) {
             _refreshSummarizerInjectionAvailability?.();
         });
 
-    // Qdrant cloud toggle
+    // Qdrant cloud toggle.
+    //
+    // Visibility and re-initialization are deliberately SEPARATE. This used to be one
+    // handler ending in `.trigger('change')`, which meant simply rendering the settings
+    // panel reset backend health, eagerly initialized the Qdrant backend, pushed config
+    // to the Similharity plugin, and popped a success toast — on every page load, even
+    // with the VectFox master switch off. Backend init is already lazy (getBackend →
+    // initializeBackend), so nothing needs that eager call. Only a real user-driven
+    // mode change should re-initialize.
+    const applyQdrantModeVisibility = (useCloud) => {
+        $('#VectFox_qdrant_local_settings').toggle(!useCloud);
+        $('#VectFox_qdrant_cloud_settings').toggle(!!useCloud);
+    };
+
     $('#VectFox_qdrant_use_cloud')
         .prop('checked', settings.qdrant_use_cloud || false)
         .on('change', async function() {
@@ -2889,14 +3405,7 @@ function bindSettingsEvents(settings, callbacks) {
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
 
-            // Toggle between local and cloud settings
-            if (settings.qdrant_use_cloud) {
-                $('#VectFox_qdrant_local_settings').hide();
-                $('#VectFox_qdrant_cloud_settings').show();
-            } else {
-                $('#VectFox_qdrant_local_settings').show();
-                $('#VectFox_qdrant_cloud_settings').hide();
-            }
+            applyQdrantModeVisibility(settings.qdrant_use_cloud);
 
             // Reset backend health to force re-initialization with new config
             log.lifecycle('VectFox: Qdrant mode changed, forcing re-initialization...');
@@ -2916,12 +3425,14 @@ function bindSettingsEvents(settings, callbacks) {
                     toastr.warning('Failed to reinitialize Qdrant: ' + e.message, 'VectFox');
                 }
             }
-        })
-        .trigger('change');
+        });
+
+    // Initial state only — no health reset, no backend init, no toast.
+    applyQdrantModeVisibility(settings.qdrant_use_cloud || false);
 
     // Qdrant settings
     $('#VectFox_qdrant_host')
-        .val(settings.qdrant_host || 'localhost')
+        .val(settings.qdrant_host || '127.0.0.1')
         .on('input', function() {
             settings.qdrant_host = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
@@ -3006,15 +3517,28 @@ function bindSettingsEvents(settings, callbacks) {
         $('#VectFox_qdrant_settings').show();
     }
 
+    // On initial load: disable the Qdrant option when the plugin is absent and,
+    // if the saved backend was Qdrant, revert to Standard (with a red alert).
+    // When it reverts, re-sync the backend-dependent UI to Standard.
+    _refreshQdrantPluginAvailability().then((reverted) => {
+        if (reverted) {
+            applyBackendHybridDefaults('standard');
+            updateNativeHybridUI();
+            resetBackendHealth();
+            _refreshCosineWeightAvailability?.();
+            _refreshSummarizerInjectionAvailability?.();
+        }
+    });
+
     // Embedding provider
     $('#VectFox_source')
-        .val(settings.source)
+        .val(settings.embedding_provider)
         .on('change', function() {
-            settings.source = String($(this).val());
+            settings.embedding_provider = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
-            toggleProviderSettings(settings.source, settings);
-            log.lifecycle(`VectFox: Embedding provider changed to ${settings.source}`);
+            toggleProviderSettings(settings.embedding_provider, settings);
+            log.lifecycle(`VectFox: Embedding provider changed to ${settings.embedding_provider}`);
             // Reset health cache since provider change may affect backend connectivity
             resetBackendHealth();
         });
@@ -3302,6 +3826,70 @@ function bindSettingsEvents(settings, callbacks) {
             saveSettingsDebounced();
         });
 
+    // Per-turn token-saved readout, fed by window.VectFox_LastGhost (set inside
+    // applyGhosting on every enabled generation). Refreshed on init, on toggle, and
+    // after each AI reply / swipe via the event subscriptions below.
+    const _refreshGhostReadout = () => {
+        const $el = $('#VectFox_eventbase_ghost_readout');
+        if ($el.length === 0) return;
+        if (!settings.eventbase_ghost_enabled || !settings.summarizer_injection_enabled) {
+            $el.text('Last turn: ghosting off.');
+            return;
+        }
+        const g = window.VectFox_LastGhost;
+        if (!g || typeof g.wiped !== 'number') {
+            $el.text('Last turn: no generation yet.');
+        } else if (g.wiped === 0) {
+            $el.text('Last turn: 0 messages wiped (nothing vectorized below the recent tail yet).');
+        } else {
+            $el.html(`Last turn: wiped <strong>${g.wiped}</strong> message(s) — ~${g.charsRemoved.toLocaleString()} chars (<strong>~${g.approxTokens.toLocaleString()} tokens</strong>) saved.`);
+        }
+    };
+
+    // Ghosting controls depend on Summarizer Injection being on (the wipe self-gates
+    // on it too). Grey out + disable when it's off, with a one-line nudge.
+    const _applyGhostAvailability = () => {
+        const summOn = !!settings.summarizer_injection_enabled;
+        const ghostOn = !!settings.eventbase_ghost_enabled;
+        $('#VectFox_eventbase_ghost_enabled').prop('disabled', !summOn);
+        $('#VectFox_eventbase_ghost_keep_recent').prop('disabled', !summOn || !ghostOn);
+        const $group = $('#VectFox_eventbase_ghost_group');
+        $group.css('opacity', summOn ? '1' : '0.5');
+        if (!summOn) {
+            if ($group.find('[data-lock="needs-summarizer"]').length === 0) {
+                $group.append('<small class="VectFox_hint" data-lock="needs-summarizer" style="display:block; color: var(--warning, #e0a800);">Enable Summarizer Injection above to use ghosting.</small>');
+            }
+        } else {
+            $group.find('[data-lock="needs-summarizer"]').remove();
+        }
+        _refreshGhostReadout();
+    };
+
+    // Refresh the readout after each generation completes (reply + swipe regenerate).
+    eventSource.on(event_types.MESSAGE_RECEIVED, _refreshGhostReadout);
+    eventSource.on(event_types.MESSAGE_SWIPED, _refreshGhostReadout);
+
+    $('#VectFox_eventbase_ghost_enabled')
+        .prop('checked', !!settings.eventbase_ghost_enabled)
+        .on('change', function() {
+            settings.eventbase_ghost_enabled = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+            _applyGhostAvailability();
+        });
+
+    const _ghostKeep0 = Math.max(0, Math.min(100, parseInt(settings.eventbase_ghost_keep_recent ?? 10, 10) || 0));
+    $('#VectFox_eventbase_ghost_keep_recent_val').text(_ghostKeep0);
+    $('#VectFox_eventbase_ghost_keep_recent')
+        .val(_ghostKeep0)
+        .on('input', function() {
+            const val = Math.max(0, Math.min(100, parseInt(this.value, 10) || 0));
+            settings.eventbase_ghost_keep_recent = val;
+            $('#VectFox_eventbase_ghost_keep_recent_val').text(val);
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
     // One-way lock: enabling Summarizer Injection forces + locks the auto-sync
     // window to 1 turn (so "last N events" == "last N turns"). Flipping the slider
     // to 1 via .trigger('input') reuses its own handler, which re-stamps the marker
@@ -3322,6 +3910,7 @@ function bindSettingsEvents(settings, callbacks) {
             $slider.prop('disabled', false);
             $group.find('[data-lock="summarizer"]').remove();
         }
+        _applyGhostAvailability(); // ghosting requires summarizer injection — keep in sync
     };
 
     $('#VectFox_summarizer_injection_enabled')
@@ -3338,10 +3927,27 @@ function bindSettingsEvents(settings, callbacks) {
             // checkbox's OWN enable flow (backlog catch-up gate, lock, marker stamp) rather
             // than duplicating it. Symmetric with the window-lock above: while the
             // summarizer runs, both the window (1 turn) and auto-sync (on) are bound to it.
+            //
+            // That flow may REFUSE (no chat, or no collection yet), and being async it
+            // cannot report back to this handler. It therefore revokes the summarizer
+            // itself via _disableSummarizerInjectionBecauseAutoSyncIsOff, so the pair can
+            // never end up disagreeing — which is what left the summarizer checked beside
+            // an unchecked auto-sync, injecting stale events as if they were the latest.
             if (enabling) {
                 const $autosync = $('#VectFox_autosync_enabled');
                 if (!$autosync.prop('checked')) {
                     $autosync.prop('checked', true).trigger('input');
+                }
+
+                // Ghosting is the summarizer's main payoff — the wiped turns rely on
+                // its injection for recall — so default it ON when the summarizer is
+                // enabled. Soft default, NOT a hard lock (unlike the 1-turn window):
+                // the ghost checkbox stays editable so the user can uncheck it. Reuses
+                // the ghost checkbox's own change handler so the setting + availability
+                // stay in sync.
+                const $ghost = $('#VectFox_eventbase_ghost_enabled');
+                if (!$ghost.prop('checked')) {
+                    $ghost.prop('checked', true).trigger('change');
                 }
             }
         });
@@ -3374,6 +3980,16 @@ function bindSettingsEvents(settings, callbacks) {
         .prop('checked', settings.autosync_show_progress_modal === true)
         .on('change', function() {
             settings.autosync_show_progress_modal = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    // Per-turn retrieval budget. Clamped through the same resolver the retrieval
+    // path uses, so the field can never accept a value the budget won't honor.
+    $('#VectFox_retrieval_timeout_ms')
+        .val(resolveRetrievalTimeoutMs(settings))
+        .on('change input', function() {
+            settings.retrieval_timeout_ms = resolveRetrievalTimeoutMs({ retrieval_timeout_ms: $(this).val() });
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -3538,7 +4154,28 @@ function bindSettingsEvents(settings, callbacks) {
     // (e.g. chat just got vectorized) and chat-changed shift the state.
     const _refreshAutoSync = () => refreshAutoSyncCheckbox(extension_settings.vectfox);
     document.addEventListener('vectfox:collections-updated', _refreshAutoSync);
-    document.addEventListener('vectfox:eventbase-synced', _refreshAutoSync);
+
+    document.addEventListener('vectfox:eventbase-synced', () => {
+        // The chat just gained a collection because the user was sent here by
+        // ticking auto-sync. Finish what they started: re-run the enable flow,
+        // which now finds a collection and takes the normal path (straight on if
+        // fully synced, catch-up prompt if not). Refreshing alone would only
+        // re-read the stored "off" and leave the box unticked — the bug this
+        // fixes.
+        const pendingChat = _autoSyncEnableAwaitingVectorizeForChat;
+        _autoSyncEnableAwaitingVectorizeForChat = null;
+        if (pendingChat && pendingChat === getCurrentChatId()) {
+            $('#VectFox_autosync_enabled').prop('checked', true).trigger('input');
+            return; // that flow sets the checkbox itself
+        }
+        _refreshAutoSync();
+    });
+
+    // Closed without vectorizing — the user changed their mind, so drop the
+    // intent rather than enabling auto-sync off some later unrelated run.
+    document.addEventListener('vectfox:content-vectorizer-closed', () => {
+        _autoSyncEnableAwaitingVectorizeForChat = null;
+    });
 
     // Debug buttons: Test semantic WI and dump registry
     $('#VectFox_wi_test_btn').on('click', async function() {
@@ -3786,19 +4423,19 @@ function bindSettingsEvents(settings, callbacks) {
 
     // Ollama alternative endpoint
     $('#VectFox_ollama_use_alt_endpoint')
-        .prop('checked', settings.ollama_use_alt_endpoint)
+        .prop('checked', settings.embedding_ollama_url_override)
         .on('input', function() {
-            settings.ollama_use_alt_endpoint = $(this).prop('checked');
+            settings.embedding_ollama_url_override = $(this).prop('checked');
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
-            $('#VectFox_ollama_alt_endpoint_url').toggle(settings.ollama_use_alt_endpoint);
+            $('#VectFox_ollama_alt_endpoint_url').toggle(settings.embedding_ollama_url_override);
         });
 
     $('#VectFox_ollama_alt_endpoint_url')
-        .val(settings.ollama_alt_endpoint_url)
-        .toggle(settings.ollama_use_alt_endpoint)
+        .val(settings.embedding_ollama_url)
+        .toggle(settings.embedding_ollama_url_override)
         .on('input', function() {
-            settings.ollama_alt_endpoint_url = String($(this).val());
+            settings.embedding_ollama_url = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -3815,19 +4452,19 @@ function bindSettingsEvents(settings, callbacks) {
 
     // vLLM alternative endpoint
     $('#VectFox_vllm_use_alt_endpoint')
-        .prop('checked', settings.vllm_use_alt_endpoint)
+        .prop('checked', settings.embedding_vllm_url_override)
         .on('input', function() {
-            settings.vllm_use_alt_endpoint = $(this).prop('checked');
+            settings.embedding_vllm_url_override = $(this).prop('checked');
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
-            $('#VectFox_vllm_alt_endpoint_url').toggle(settings.vllm_use_alt_endpoint);
+            $('#VectFox_vllm_alt_endpoint_url').toggle(settings.embedding_vllm_url_override);
         });
 
     $('#VectFox_vllm_alt_endpoint_url')
-        .val(settings.vllm_alt_endpoint_url)
-        .toggle(settings.vllm_use_alt_endpoint)
+        .val(settings.embedding_vllm_url)
+        .toggle(settings.embedding_vllm_url_override)
         .on('input', function() {
-            settings.vllm_alt_endpoint_url = String($(this).val());
+            settings.embedding_vllm_url = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -3882,9 +4519,9 @@ function bindSettingsEvents(settings, callbacks) {
 
     // Ollama model
     $('#VectFox_ollama_model')
-        .val(settings.ollama_model)
+        .val(settings.embedding_ollama_model)
         .on('input', function() {
-            settings.ollama_model = String($(this).val());
+            settings.embedding_ollama_model = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -4071,6 +4708,20 @@ function bindSettingsEvents(settings, callbacks) {
     _bindEventBaseNumber('max_tokens', 'eventbase_max_tokens');
     _bindEventBaseNumber('timeout_ms', 'eventbase_timeout_ms');
 
+    // Summarizer timeout lives in the EventBase tab next to the extraction timeout
+    // (both bound the same configured model). Its setting key is summarize_*, so it
+    // can't go through _bindEventBaseNumber (which prefixes ids/keys with eventbase_).
+    $('#VectFox_summarize_timeout_ms')
+        .val(settings.summarize_timeout_ms ?? '')
+        .on('change', function() {
+            const v = parseFloat($(this).val());
+            if (!isNaN(v)) {
+                settings.summarize_timeout_ms = v;
+                Object.assign(extension_settings.vectfox, settings);
+                saveSettingsDebounced();
+            }
+        });
+
     // Re-rank weight inputs
     ['rerank_w_cosine', 'rerank_w_importance', 'rerank_w_persist', 'rerank_w_recency'].forEach(k => {
         $(`#VectFox_eventbase_${k}`)
@@ -4191,9 +4842,9 @@ function bindSettingsEvents(settings, callbacks) {
 
     // vLLM model
     $('#VectFox_vllm_model')
-        .val(settings.vllm_model)
+        .val(settings.embedding_vllm_model)
         .on('input', function() {
-            settings.vllm_model = String($(this).val());
+            settings.embedding_vllm_model = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -4256,9 +4907,9 @@ function bindSettingsEvents(settings, callbacks) {
 
     // OpenRouter model
     $('#VectFox_openrouter_model')
-        .val(settings.openrouter_model)
+        .val(settings.embedding_openrouter_model)
         .on('input', function() {
-            settings.openrouter_model = String($(this).val());
+            settings.embedding_openrouter_model = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
@@ -4456,6 +5107,15 @@ function bindSettingsEvents(settings, callbacks) {
         });
     $('#VectFox_insert_batch_size_value').text(settings.insert_batch_size || 50);
 
+    // Acronym glossary injection (Documents) — see core/glossary-extractor.js
+    $('#VectFox_document_glossary_injection')
+        .prop('checked', settings.document_glossary_injection !== false)
+        .on('change', function() {
+            settings.document_glossary_injection = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
     // Minimum chat length before injection starts
     $('#VectFox_min_chat_length')
         .val(settings.min_chat_length ?? 0)
@@ -4501,7 +5161,7 @@ function bindSettingsEvents(settings, callbacks) {
     });
 
     // Initialize provider-specific settings visibility
-    toggleProviderSettings(settings.source, settings);
+    toggleProviderSettings(settings.embedding_provider, settings);
 }
 
 /**
@@ -4832,7 +5492,7 @@ function copyDiagnosticsReport(results) {
     // Get current settings for the report
     const settings = extension_settings.vectfox;
     const backend = settings.vector_backend || 'qdrant';
-    const source = settings.source || 'none';
+    const source = settings.embedding_provider || 'none';
     const modelField = getModelField(source);
     const model = modelField ? (settings[modelField] || 'not set') : 'n/a (provider handles it)';
     const qdrantMode = settings.qdrant_mode || 'local';
@@ -4843,13 +5503,13 @@ function copyDiagnosticsReport(results) {
     // Build provider URL info
     let providerUrl = 'n/a';
     if (source === 'ollama') {
-        providerUrl = settings.ollama_use_alt_endpoint && settings.ollama_alt_endpoint_url
-            ? settings.ollama_alt_endpoint_url
-            : (textgenerationwebui_settings?.server_urls?.[textgen_types?.OLLAMA] || 'http://localhost:11434');
+        providerUrl = settings.embedding_ollama_url_override && settings.embedding_ollama_url
+            ? settings.embedding_ollama_url
+            : (textgenerationwebui_settings?.server_urls?.[textgen_types?.OLLAMA] || 'http://127.0.0.1:11434');
     } else if (source === 'vllm') {
-        providerUrl = settings.vllm_use_alt_endpoint && settings.vllm_alt_endpoint_url
-            ? settings.vllm_alt_endpoint_url
-            : (textgenerationwebui_settings?.server_urls?.[textgen_types?.VLLM] || 'http://localhost:8000');
+        providerUrl = settings.embedding_vllm_url_override && settings.embedding_vllm_url
+            ? settings.embedding_vllm_url
+            : (textgenerationwebui_settings?.server_urls?.[textgen_types?.VLLM] || 'http://127.0.0.1:8000');
     }
 
     let report = `╔══════════════════════════════════════════════════════════════╗

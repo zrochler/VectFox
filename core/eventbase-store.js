@@ -19,7 +19,7 @@ import { saveSettingsDebounced, getRequestHeaders, getCurrentChatId } from '../.
 import { extension_settings, getContext } from '../../../../extensions.js';
 import { getChatUUID, buildEventBaseCollectionId, getRegistryBackend, COLLECTION_PREFIXES, parseRegistryKey, buildChatSearchPatterns, matchesPatterns } from './collection-ids.js';
 import { registerCollection, getCollectionRegistry, getCollectionListing } from './collection-loader.js';
-import { getChatLockedCollections, isCollectionLockedToChat } from './collection-metadata.js';
+import { getChatLockedCollections, isCollectionActiveForContextAnyKey } from './collection-metadata.js';
 import { buildEmbedText } from './eventbase-schema.js';
 import { log } from './log.js';
 
@@ -825,26 +825,63 @@ export function resolveActiveEventBaseCollection(settings, chatUUID) {
     const uuid = chatUUID || getChatUUID();
     if (!uuid) return null;
 
-    // Match by UUID (stable across legacy ID formats and character renames).
-    const patterns = buildChatSearchPatterns(null, uuid);
-    const isEbMatch = ({ collectionId, registryKey, isOwn }) => {
-        if (!isOwn) return false;
-        const idLower = String(collectionId || '').toLowerCase();
-        if (!idLower.startsWith('vf_eventbase_') && !idLower.includes('eventbase_')) return false;
-        return matchesPatterns(collectionId, patterns) || matchesPatterns(registryKey, patterns);
-    };
-    const ebMatches = getCollectionListing(settings).filter(isEbMatch);
-    if (ebMatches.length === 0) return null;
-
     // Disambiguate persona collections: lock dominates, current backend
     // tie-breaks, otherwise listing order. The lock index is keyed by the active
     // chat id, so the lock is only meaningful when resolving the current chat.
+    // Computed up front because the ownership filter below also consults it.
     const chatId = (uuid === getChatUUID()) ? getCurrentChatId() : null;
+    const isLocked = (m) => !!chatId && isCollectionActiveForContextAnyKey(
+        [m.registryKey, m.collectionId], { chatId });
+
+    // Match by UUID (stable across legacy ID formats and character renames).
+    const patterns = buildChatSearchPatterns(null, uuid);
+    const isEbMatch = (entry) => {
+        const { collectionId, registryKey } = entry;
+        const idLower = String(collectionId || '').toLowerCase();
+        if (!idLower.startsWith('vf_eventbase_') && !idLower.includes('eventbase_')) return false;
+        // An explicit per-chat lock is a deliberate user override: the collection
+        // is eligible regardless of ownership AND regardless of whether its
+        // embedded UUID still matches this chat. The UUID can drift from the lock
+        // after a delete + re-vectorize cycle (the chat gets a fresh UUID, but the
+        // user re-locks the old collection), or when intentionally binding another
+        // chat's EventBase here. This matches the DB Browser's lock-only "Active
+        // here" badge and the retrieval path (_gatherLockedEventBaseCollections),
+        // both of which honor the lock without a UUID check. Without this the lock
+        // resolves as ACTIVE in the UI yet auto-sync reports "no collection".
+        if (isLocked(entry)) return true;
+        // Auto-association (no lock): must be owned by the current persona AND its
+        // embedded UUID must match the current chat.
+        if (!entry.isOwn) return false;
+        return matchesPatterns(collectionId, patterns) || matchesPatterns(registryKey, patterns);
+    };
+    const listing = getCollectionListing(settings);
+    const ebMatches = listing.filter(isEbMatch);
+
+    // Diagnostic: why each EventBase collection was/ wasn't picked. Surfaces the
+    // exact reason auto-sync sees "no collection" (e.g. lock missing, or UUID
+    // drifted after a re-vectorize and no lock to override it).
+    if (log.enabled('lifecycle')) {
+        const ebAll = listing.filter(e => {
+            const il = String(e.collectionId || '').toLowerCase();
+            return il.startsWith('vf_eventbase_') || il.includes('eventbase_');
+        });
+        const rows = ebAll.map(e => {
+            const uuidMatch = matchesPatterns(e.collectionId, patterns) || matchesPatterns(e.registryKey, patterns);
+            return `${e.collectionId} [own=${e.isOwn} locked=${isLocked(e)} uuidMatch=${uuidMatch} eligible=${isEbMatch(e)}]`;
+        });
+        log.lifecycle(`[EventBase][resolve] chatUUID=${uuid} chatId=${chatId || '(none)'}: ${ebAll.length} eb collection(s), ${ebMatches.length} eligible`);
+        for (const r of rows) log.lifecycle(`[EventBase][resolve]   ${r}`);
+    }
+
+    if (ebMatches.length === 0) {
+        log.lifecycle('[EventBase][resolve] → no eligible collection (auto-sync will report "no-collection")');
+        return null;
+    }
+
     const wantBackend = getRegistryBackend(settings?.vector_backend);
-    const isLocked = (m) => !!chatId && (isCollectionLockedToChat(m.registryKey, chatId)
-                                      || isCollectionLockedToChat(m.collectionId, chatId));
     const rank = (m) => (isLocked(m) ? 0 : 10) + (m.backend === wantBackend ? 0 : 1);
     const active = ebMatches.slice().sort((a, b) => rank(a) - rank(b))[0];
+    log.lifecycle(`[EventBase][resolve] → picked ${active.collectionId} (locked=${isLocked(active)})`);
     return { collectionId: active.collectionId, registryKey: active.registryKey };
 }
 

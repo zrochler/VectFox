@@ -41,8 +41,18 @@ import {
     sanitizeNameSegment,
 } from './collection-ids.js';
 
-// Plugin detection state
+// Plugin detection state. `pluginAvailable` is the settled result; `pluginProbeInFlight`
+// holds the promise for a probe that has started but not finished, so concurrent callers
+// share one /health request instead of each firing their own (which produced N duplicate
+// "Plugin detected" log lines and N redundant fetches at startup).
 let pluginAvailable = null;
+let pluginProbeInFlight = null;
+// Version string reported by the SAME /health probe. Kept because /health has
+// returned `version` since the plugin's initial commit (2025-11-21), while the
+// dedicated /version route only arrived 2026-05-14 — so this is the only source
+// that can identify a plugin old enough to be worth warning about. Null means
+// "no plugin, or it answered /health without a version field".
+let pluginVersion = null;
 
 /**
  * Detect collection IDs that VECTFOX should NOT register or query.
@@ -533,11 +543,10 @@ function getCollectionDisplayName(collectionId, metadata) {
  * Checks if the Similharity plugin is available.
  * This is the canonical implementation — shared with ui/database-browser.js via export.
  *
- * !! SYNC WARNING !!
- * backends/standard.js has an INDEPENDENT copy of this check (this.pluginAvailable
- * set in initialize()) because it cannot import from here without a circular
- * dependency. If you change the health endpoint, response parsing, or caching
- * logic here, you MUST make the same change in StandardBackend.initialize().
+ * Single source of truth. backends/standard.js used to keep an independent copy
+ * (it cannot import this module statically without a circular dependency) but now
+ * reaches it via dynamic import in initialize(), so there is no second copy to
+ * keep in sync — one /health request serves every consumer.
  *
  * @returns {Promise<boolean>} True if plugin is available
  */
@@ -545,25 +554,72 @@ export async function checkPluginAvailable() {
     if (pluginAvailable !== null) {
         return pluginAvailable;
     }
-
-    try {
-        const response = await fetch('/api/plugins/similharity/health', {
-            method: 'GET',
-            headers: getRequestHeaders()
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            pluginAvailable = data.status === 'ok';
-            log.lifecycle(`VectFox: Plugin ${pluginAvailable ? 'detected' : 'not found'} (v${data.version || 'unknown'})`);
-        } else {
-            pluginAvailable = false;
-        }
-    } catch (error) {
-        pluginAvailable = false;
+    // A probe is already running — join it rather than starting a second one.
+    if (pluginProbeInFlight) {
+        return pluginProbeInFlight;
     }
 
-    return pluginAvailable;
+    pluginProbeInFlight = (async () => {
+        try {
+            const response = await fetch('/api/plugins/similharity/health', {
+                method: 'GET',
+                headers: getRequestHeaders()
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                pluginAvailable = data.status === 'ok';
+                // Keep the version: it is the ONLY reliable way to spot a plugin
+                // too old to have the /version route (added 2026-05-14). See
+                // getDetectedPluginVersion().
+                pluginVersion = typeof data.version === 'string' && data.version ? data.version : null;
+                log.lifecycle(`VectFox: Plugin ${pluginAvailable ? 'detected' : 'not found'} (v${pluginVersion || 'unknown'})`);
+            } else {
+                pluginAvailable = false;
+            }
+        } catch (error) {
+            pluginAvailable = false;
+        } finally {
+            pluginProbeInFlight = null;
+        }
+
+        return pluginAvailable;
+    })();
+
+    return pluginProbeInFlight;
+}
+
+/**
+ * Clears the session-cached plugin-availability result so the next
+ * checkPluginAvailable() call re-probes /health. Used by test isolation and
+ * any flow that needs to force a fresh detection (e.g. after the user is told
+ * to restart ST to pick up a newly-installed plugin).
+ */
+export function resetPluginAvailableCache() {
+    pluginAvailable = null;
+    pluginVersion = null;
+    // Drop the in-flight join point too, so a probe started before the reset can't
+    // hand its now-stale result to a caller that asked for a fresh detection.
+    pluginProbeInFlight = null;
+}
+
+/**
+ * Version string the plugin reported on its LAST /health probe, or null when no
+ * plugin is installed / it answered without a version field.
+ *
+ * Read this instead of requesting /api/plugins/similharity/version: /health has
+ * carried `version` since the plugin's initial commit (2025-11-21), whereas the
+ * /version route only landed 2026-05-14. A plugin predating that route 404s on
+ * it — and a plugin that old is exactly the one worth warning about, so sourcing
+ * the check from /version made it blind in the single case it existed for.
+ *
+ * Only meaningful after checkPluginAvailable() has settled; callers gate on that
+ * first anyway, since a version is uninteresting when there is no plugin.
+ *
+ * @returns {string|null}
+ */
+export function getDetectedPluginVersion() {
+    return pluginVersion;
 }
 
 // Cache for plugin collection data
@@ -700,9 +756,28 @@ async function discoverViaPlugin(settings) {
 
             // The plugin probes every standard (vectra) and qdrant collection that
             // actually exists. Anything in the registry that was NOT found = stale.
-            // Remove it unconditionally — no backend exemptions.
+            //
+            // EXCEPT: absence from the scan only means "deleted" for backends the
+            // plugin actually reached. `qdrantScanned` is false when the Qdrant
+            // health check failed — the scan then contains zero qdrant collections
+            // not because they were deleted but because the server was unreachable.
+            // Pruning them here cascaded into cleanupOrphanedMeta() deleting their
+            // metadata (chat/character locks, triggers, scope, names) on the next
+            // DB-browser refresh — a transient Qdrant hiccup permanently unlocked
+            // lorebooks (issue #11 "it stopped working out of the blue").
+            // Older plugins don't report the flag at all (undefined); treat that as
+            // not-scanned too — a lingering ghost registry entry is recoverable from
+            // the DB browser, silently wiped locks are not.
+            const qdrantVerified = data.qdrantScanned === true;
             const updatedRegistry = getCollectionRegistry();
-            const staleEntries = updatedRegistry.filter(key => !pluginKeySet.has(key));
+            const staleCandidates = updatedRegistry.filter(key => !pluginKeySet.has(key));
+            const staleEntries = qdrantVerified
+                ? staleCandidates
+                : staleCandidates.filter(key => parseRegistryKey(key).backend !== 'qdrant');
+            const preservedUnverified = staleCandidates.length - staleEntries.length;
+            if (preservedUnverified > 0) {
+                log.warn(`VectFox: Qdrant was not reachable during discovery — keeping ${preservedUnverified} qdrant registry entr${preservedUnverified === 1 ? 'y' : 'ies'} (and their locks/metadata) instead of pruning. They will re-verify on the next discovery once Qdrant is back.`);
+            }
             if (staleEntries.length > 0) {
                 log.trace(`   🗑️  Removing ${staleEntries.length} stale registry entries:`);
                 for (const staleKey of staleEntries) {
@@ -849,12 +924,17 @@ async function probeCollection(collectionId, settings) {
     try {
         const hashes = await getSavedHashes(collectionId, settings);
         if (hashes && hashes.length > 0) {
-            return { exists: true, count: hashes.length };
+            return { exists: true, count: hashes.length, unreachable: false };
         }
     } catch (error) {
-        // Collection doesn't exist or error - that's fine
+        // A probe error is NOT "collection doesn't exist" — it usually means the
+        // backend/transport was unavailable for this one request. Callers that
+        // prune on exists:false must check `unreachable` first, or a transient
+        // outage gets recorded as a permanent deletion (and cleanupOrphanedMeta
+        // then wipes the collection's locks/metadata).
+        return { exists: false, count: 0, unreachable: true };
     }
-    return { exists: false, count: 0 };
+    return { exists: false, count: 0, unreachable: false };
 }
 
 /**
@@ -886,6 +966,17 @@ async function discoverViaFallback(settings) {
         const parsed = parseRegistryKey(registryKey);
         const collectionId = parsed.collectionId;
 
+        // Fallback discovery runs precisely because the plugin is unavailable —
+        // and qdrant collections are only reachable THROUGH the plugin. Probing
+        // one here goes down the standard path, finds nothing, and would prune a
+        // perfectly healthy qdrant collection (whose locks/metadata then get
+        // wiped by cleanupOrphanedMeta). Unverifiable ≠ deleted: keep it.
+        if (parsed.backend === 'qdrant') {
+            validRegistryEntries.push(registryKey);
+            log.verbose(`VectFox: Keeping qdrant registry entry (not verifiable without the plugin): ${registryKey}`);
+            continue;
+        }
+
         const result = await probeCollection(collectionId, settings);
         if (result.exists) {
             validRegistryEntries.push(registryKey);
@@ -893,6 +984,10 @@ async function discoverViaFallback(settings) {
                 discovered.push(registryKey);
             }
             log.verbose(`VectFox: Verified registry entry: ${collectionId} (${result.count} chunks)`);
+        } else if (result.unreachable) {
+            // Transport/backend error — unknown state, NOT proof of deletion.
+            validRegistryEntries.push(registryKey);
+            log.warn(`VectFox: Could not verify registry entry ${registryKey} (probe failed) — keeping it and its metadata; will re-verify on next discovery.`);
         } else {
             // Remove stale entry
             unregisterCollection(registryKey);

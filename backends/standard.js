@@ -34,6 +34,7 @@ import { INTERNAL_COLLECTION_IDS } from '../core/collection-ids.js';
 import { extension_settings } from '../../../../extensions.js';
 import { oai_settings } from '../../../../openai.js';
 import { log } from '../core/log.js';
+import { warnIfEmbeddingSlow } from '../core/embedding-latency-warning.js';
 
 
 /**
@@ -44,7 +45,7 @@ import { log } from '../core/log.js';
  */
 function getProviderSpecificParams(settings, isQuery = false) {
     const params = {};
-    const source = settings.source;
+    const source = settings.embedding_provider;
 
     switch (source) {
         case 'extras':
@@ -149,19 +150,18 @@ export class StandardBackend extends VectorBackend {
     }
 
     async initialize(settings) {
-        // Check if plugin is available.
-        // !! SYNC WARNING !!
-        // This is an INDEPENDENT copy of checkPluginAvailable() from
-        // core/collection-loader.js. We cannot import from there because
-        // collection-loader → core-vector-api → (dynamic import) → standard.js
-        // would create a circular dependency.
-        // If you change the health endpoint or response parsing here,
-        // make the same change in collection-loader.js::checkPluginAvailable().
+        // Check if plugin is available via the canonical, session-cached probe
+        // in core/collection-loader.js. Dynamic import breaks the otherwise
+        // circular static dependency (collection-loader → core-vector-api →
+        // (dynamic import) → standard.js), the same pattern corpus-stats.js
+        // uses. Routing through the shared cache means a no-plugin install
+        // issues exactly ONE /health request total (and thus at most one 404 in
+        // the browser console) instead of one per backend/UI consumer.
         log.lifecycle('VectFox DEBUG: Checking plugin availability...');
         try {
-            const response = await fetch('/api/plugins/similharity/health');
-            log.lifecycle('VectFox DEBUG: Plugin health check response:', response.status, response.ok);
-            this.pluginAvailable = response.ok;
+            const { checkPluginAvailable } = await import('../core/collection-loader.js');
+            this.pluginAvailable = await checkPluginAvailable();
+            log.lifecycle('VectFox DEBUG: Plugin available:', this.pluginAvailable);
 
             if (this.pluginAvailable) {
                 await fetch('/api/plugins/similharity/backend/init/vectra', {
@@ -212,7 +212,7 @@ export class StandardBackend extends VectorBackend {
             headers: getRequestHeaders(),
             body: JSON.stringify({
                 collectionId: collectionId,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: model,
                 ...providerParams,
             }),
@@ -411,7 +411,7 @@ export class StandardBackend extends VectorBackend {
                     }
                     return mappedItem;
                 }),
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: model,
                 ...providerParams,
             } : {
@@ -421,7 +421,7 @@ export class StandardBackend extends VectorBackend {
                     text: item.text || '',
                     index: item.index ?? 0,
                 })),
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: model,
                 // Pass embeddings if pre-computed (for webllm, koboldcpp)
                 embeddings: items[0]?.vector ? Object.fromEntries(items.map(i => [
@@ -481,7 +481,7 @@ export class StandardBackend extends VectorBackend {
                 // enforceStatusGate:false. Surface it instead of silently failing ingestion.
                 throwIfModelConfigError({
                     contextLabel: 'Embedding',
-                    provider: settings.source,
+                    provider: settings.embedding_provider,
                     model,
                     status: response.status,
                     responseText: errorBody,
@@ -496,7 +496,7 @@ export class StandardBackend extends VectorBackend {
             const isOOM = error.message?.includes('OrtRun') || error.message?.includes('error code = 6');
             if (isOOM) {
                 log.error(`VectFox: ONNX OOM Error while embedding. Diagnostics:`);
-                log.error(`  - Provider: ${settings.source}`);
+                log.error(`  - Provider: ${settings.embedding_provider}`);
                 log.error(`  - Model: ${model || '(default)'}`);
                 log.error(`  - Batch size: ${items.length} chunks`);
                 log.error(`  - Largest chunk: ${maxLen} chars (index ${longestChunkIndex})`);
@@ -513,7 +513,7 @@ export class StandardBackend extends VectorBackend {
      */
     async deleteVectorItems(collectionId, hashes, settings) {
         const model = getModelFromSettings(settings);
-        const source = settings.source || 'transformers';
+        const source = settings.embedding_provider || 'transformers';
 
         // Strip backend prefix from registry keys (same as queryCollection)
         const knownBackends = ['standard', 'vectra', 'qdrant'];
@@ -575,7 +575,7 @@ export class StandardBackend extends VectorBackend {
      */
     async queryCollection(collectionId, searchText, topK, settings, queryVector = null) {
         const model = getModelFromSettings(settings);
-        const source = settings.source || 'transformers';
+        const source = settings.embedding_provider || 'transformers';
         const threshold = settings.score_threshold || 0.0;
 
         // Registry keys arrive as "backend:collectionId". Strip the backend prefix
@@ -600,6 +600,13 @@ export class StandardBackend extends VectorBackend {
                 threshold,
                 source,
                 model,
+                // Pass provider params (apiUrl for url-based sources like vllm/
+                // ollama/llamacpp) so the plugin embeds the searchText against the
+                // user's configured endpoint instead of falling back to localhost.
+                // Without this the plugin defaulted to http://localhost:8000, which
+                // hit SillyTavern itself and failed CSRF (GitHub issue #7). Matches
+                // the insert path and the qdrant backend's query body.
+                ...getProviderSpecificParams(settings, true),
             };
             // Pass pre-computed vector when available; otherwise let the plugin generate it
             if (queryVector) {
@@ -623,7 +630,7 @@ export class StandardBackend extends VectorBackend {
                 log.error(`[VectFox] plugin query failed: ${errorBody}`);
                 throwIfModelConfigError({
                     contextLabel: 'Embedding',
-                    provider: settings.source,
+                    provider: settings.embedding_provider,
                     model,
                     status: response.status,
                     responseText: errorBody,
@@ -633,7 +640,8 @@ export class StandardBackend extends VectorBackend {
             }
 
             const data = await response.json();
-            log.verbose(`[VectFox] plugin query result: count=${data.count}, results.length=${data.results?.length}, error=${data.error || 'none'}`);
+            log.verbose(`[VectFox] plugin query result: count=${data.count}, results.length=${data.results?.length}, embed=${data.timings?.embedMs ?? 'n/a'}ms, query=${data.timings?.queryMs ?? 'n/a'}ms, error=${data.error || 'none'}`);
+            warnIfEmbeddingSlow(data.timings?.embedMs, settings, 'query');
 
             // Plugin returns { success, results: [{ hash, score, text, metadata }] }
             const results = data.results || [];
@@ -676,7 +684,7 @@ export class StandardBackend extends VectorBackend {
             const errorBody = await response.text().catch(() => 'No response body');
             throwIfModelConfigError({
                 contextLabel: 'Embedding',
-                provider: settings.source,
+                provider: settings.embedding_provider,
                 model,
                 status: response.status,
                 responseText: errorBody,
@@ -712,7 +720,7 @@ export class StandardBackend extends VectorBackend {
             searchText: searchText,
             topK: topK,
             threshold: threshold,
-            source: settings.source || 'transformers',
+            source: settings.embedding_provider || 'transformers',
             model: model,
             ...providerParams,
         };
@@ -829,7 +837,7 @@ export class StandardBackend extends VectorBackend {
         // every model subdir so the on-disk dirs are actually deleted; otherwise
         // the collection re-appears on the next discovery scan.
         if (this.pluginAvailable) {
-            const source = settings.source || 'transformers';
+            const source = settings.embedding_provider || 'transformers';
             const discoveredModels = Array.isArray(settings._discoveredModels) && settings._discoveredModels.length > 0
                 ? settings._discoveredModels.map(m => m?.path ?? m ?? '')
                 : [getModelFromSettings(settings)];
@@ -919,7 +927,7 @@ export class StandardBackend extends VectorBackend {
                     body: JSON.stringify({
                         backend: 'vectra',
                         collectionId: collectionId,
-                        source: settings.source || 'transformers',
+                        source: settings.embedding_provider || 'transformers',
                         model: getModelFromSettings(settings),
                         offset: options.offset || 0,
                         limit: options.limit || 100,
@@ -974,7 +982,7 @@ export class StandardBackend extends VectorBackend {
             const response = await fetch(`/api/plugins/similharity/chunks/${encodeURIComponent(hash)}?` + new URLSearchParams({
                 backend: 'vectra',
                 collectionId: collectionId,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
             }), {
                 headers: getRequestHeaders(),
@@ -1006,7 +1014,7 @@ export class StandardBackend extends VectorBackend {
                 backend: 'vectra',
                 collectionId: collectionId,
                 text: newText,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
             }),
         });
@@ -1034,7 +1042,7 @@ export class StandardBackend extends VectorBackend {
                 backend: 'vectra',
                 collectionId: collectionId,
                 metadata: metadata,
-                source: settings.source || 'transformers',
+                source: settings.embedding_provider || 'transformers',
                 model: getModelFromSettings(settings),
             }),
         });
@@ -1060,7 +1068,7 @@ export class StandardBackend extends VectorBackend {
                     body: JSON.stringify({
                         backend: 'vectra',
                         collectionId: collectionId,
-                        source: settings.source || 'transformers',
+                        source: settings.embedding_provider || 'transformers',
                         model: getModelFromSettings(settings),
                     }),
                 });

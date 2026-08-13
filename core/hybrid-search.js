@@ -97,6 +97,11 @@ export async function hybridSearch(collectionId, searchText, topK, settings, opt
                 rrfK,
             }, filters);
         } catch (error) {
+            // THE single fallback for the hybrid path. Backends must not degrade
+            // internally — QdrantBackend.hybridQuery used to retry vector-only on
+            // its own before this catch ran, so one failure cost three HTTP calls
+            // and the final result was an empty set indistinguishable from "no
+            // match". Keep degradation here, once, and let it stay observable.
             log.warn(`[HybridSearch] Native hybrid failed, falling back to client-side:`, error.message);
             // Fall through to client-side fusion
         }
@@ -139,7 +144,7 @@ async function clientSideHybridSearch(backend, collectionId, searchText, topK, s
 
     // 1. Vector search
     log.verbose(`[HybridSearch] Fetching ${expandedTopK} vector results from collection: ${collectionId}`);
-    log.verbose(`[HybridSearch] Backend: ${backend.constructor.name}, Source: ${settings.source}`);
+    log.verbose(`[HybridSearch] Backend: ${backend.constructor.name}, Source: ${settings.embedding_provider}`);
 
     let vectorResults;
     try {
@@ -152,8 +157,14 @@ async function clientSideHybridSearch(backend, collectionId, searchText, topK, s
         );
         log.verbose(`[HybridSearch] Raw vector results:`, vectorResults ? `hashes=${vectorResults.hashes?.length}, metadata=${vectorResults.metadata?.length}` : 'null');
     } catch (error) {
-        log.error(`[HybridSearch] Vector query failed:`, error);
-        return { hashes: [], metadata: [] };
+        // Propagate. Returning an empty set here made a dead backend look exactly
+        // like a collection with no matching chunks, which is how a Qdrant-side
+        // failure could silently zero semantic lorebook activation with no log, no
+        // toast, and no error (GitHub issue #11). Every caller of queryCollection
+        // already catches — see core/eventbase-retrieval.js, core/chat-vectorization.js,
+        // core/agentic-retrieval.js, core/world-info-integration.js.
+        log.error(`[HybridSearch] Vector query failed for ${collectionId}:`, error);
+        throw error;
     }
 
     if (!vectorResults || !vectorResults.metadata || vectorResults.metadata.length === 0) {
@@ -186,7 +197,11 @@ async function clientSideHybridSearch(backend, collectionId, searchText, topK, s
         try {
             const mod = await import('./corpus-stats.js');
             corpusStats = await mod.getCorpusStats(collectionId, settings);
-            if (!corpusStats) {
+            // Null is the normal no-plugin path (corpus-stats returns null
+            // silently when the plugin is absent — a supported, non-error
+            // configuration). Gate behind lifecycle so it only surfaces while
+            // debugging, instead of warning on every search for plugin-less users.
+            if (!corpusStats && log.enabled('lifecycle')) {
                 log.warn(`[HybridSearch] Corpus-IDF disabled for ${collectionId}: getCorpusStats returned null (plugin unavailable or /chunks/list failed). Falling back to local-IDF BM25.`);
             }
         } catch (err) {

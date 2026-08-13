@@ -25,9 +25,9 @@ import { queryCollection } from './core-vector-api.js';
 import { buildPlannerUserMessage, getAgenticPlannerPrompt } from './prompts-i18n.js';
 import { stripReasoningBlocks, stripGameSystemBlocks } from './text-cleaning.js';
 import { getOpenRouterApiKey, getCustomApiKey } from './api-keys.js';
-import { getModelConfigErrorMessage } from './model-http-errors.js';
+import { postChatCompletion, resolveModelParameterStyle, LlmCallError } from './llm-provider-call.js';
 import { generationRateLimiter, generationRateLimitSettings } from './generation-rate-limiter.js';
-import { getRequestHeaders } from '../../../../../script.js';
+import { resolveAgenticPlannerTimeoutMs, resolveAgenticQueryTimeoutMs, resolveAgenticMaxTokens } from './retrieval-budget.js';
 import { log } from './log.js';
 
 // ============================================================================
@@ -112,7 +112,7 @@ export async function retrieveEventsWithAgent(params) {
         log.domain('agent', 'lifecycle', `[VectFox-Agentic] LLM prompt size: system+user approx ${approxTokens} tokens (${systemPromptText.length}+${userMessage.length} chars)`);
     }
 
-    const timeoutMs = settings.agentic_retrieval_timeout_ms || 30000;
+    const timeoutMs = resolveAgenticPlannerTimeoutMs(settings);
     let plan;
     const tLlmStart = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     try {
@@ -126,6 +126,7 @@ export async function retrieveEventsWithAgent(params) {
                 userMessage,
                 llmCfg,
                 timeoutMs,
+                maxTokens: resolveAgenticMaxTokens(settings),
             }),
             generationRateLimitSettings(settings),
             'agent',
@@ -211,7 +212,7 @@ export async function retrieveEventsWithAgent(params) {
     // tens of seconds. Cap each query; a straggler is dropped and the other
     // queries' results still flow through. queryCollection has no abort hook, so
     // the underlying request keeps running — we just stop awaiting it.
-    const queryTimeoutMs = Math.max(1000, settings.agentic_retrieval_query_timeout_ms || 10000);
+    const queryTimeoutMs = resolveAgenticQueryTimeoutMs(settings);
     const tFanoutStart = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     const fanoutPromises = [];
     for (const colId of liveCollectionIds) {
@@ -220,7 +221,10 @@ export async function retrieveEventsWithAgent(params) {
                 _raceWithTimeout(queryCollection(colId, queryText, topK, ebSettings, plannerFilters), queryTimeoutMs)
                     .then(({ hashes, metadata }) => {
                         if (!hashes?.length) return { queryText, hits: [] };
-                        const hits = metadata.map((meta, i) => ({ ...meta, _hash: hashes[i] }));
+                        // _sortFrame tags these live-collection hits with their source
+                        // collection so the injector groups them into the same frame as
+                        // the pre-search live events before the chronological sort.
+                        const hits = metadata.map((meta, i) => ({ ...meta, _hash: hashes[i], _sortFrame: colId }));
                         return { queryText, hits };
                     })
                     .catch(err => {
@@ -303,8 +307,8 @@ export async function retrieveEventsWithAgent(params) {
  * { ok: false, reason } when a required value is missing.
  */
 export function _resolveAgenticLLMConfig(settings = {}) {
-    const provider = (settings.agentic_retrieval_provider || settings.summarize_provider || 'openrouter').toLowerCase();
-    const model = (settings.agentic_retrieval_model || settings.summarize_model || '').trim();
+    const provider = (settings.agent_provider || settings.chat_provider || 'openrouter').toLowerCase();
+    const model = (settings.agent_model || settings.chat_model || '').trim();
 
     if (!model) {
         return { ok: false, reason: 'missing_model' };
@@ -322,11 +326,11 @@ export function _resolveAgenticLLMConfig(settings = {}) {
         if (!apiKey) {
             return { ok: false, reason: 'missing_openrouter_api_key' };
         }
-        return { ok: true, provider, model, apiKey };
+        return { ok: true, provider, model, apiKey, parameterStyle: resolveModelParameterStyle(settings) };
     }
 
     if (provider === 'vllm') {
-        const vllmUrl = (settings.agentic_retrieval_vllm_url || settings.summarize_vllm_url || '').trim();
+        const vllmUrl = (settings.agent_vllm_url || settings.chat_vllm_url || '').trim();
         if (!vllmUrl) {
             return { ok: false, reason: 'missing_vllm_url' };
         }
@@ -337,7 +341,7 @@ export function _resolveAgenticLLMConfig(settings = {}) {
         if (!apiKey) {
             return { ok: false, reason: 'missing_vllm_api_key' };
         }
-        return { ok: true, provider, model, vllmUrl, apiKey };
+        return { ok: true, provider, model, vllmUrl, apiKey, parameterStyle: resolveModelParameterStyle(settings) };
     }
 
     return { ok: false, reason: `unknown_provider_${provider}` };
@@ -347,98 +351,52 @@ export function _resolveAgenticLLMConfig(settings = {}) {
  * Call the planner LLM and return parsed JSON output.
  * Throws on network/auth failure, empty response, or unparseable JSON.
  */
-async function _callPlanner({ systemPrompt, userMessage, llmCfg, timeoutMs }) {
-    const body = {
-        model: llmCfg.model,
-        messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-        ],
-        max_tokens: 2000,
-        temperature: 0.2,
-        response_format: { type: 'json_object' },
-    };
-
-    let endpoint, headers, requestBody;
-    if (llmCfg.provider === 'openrouter') {
-        // Route through ST's chat-completions proxy. llmCfg.apiKey here is the
-        // MASKED placeholder (presence indicator only); the real key is read
-        // server-side via readSecret(SECRET_KEYS.OPENROUTER). See
-        // summarizer._callOpenRouter for the full rationale.
-        endpoint = '/api/backends/chat-completions/generate';
-        headers = getRequestHeaders();
-        requestBody = { chat_completion_source: 'openrouter', ...body };
-    } else if (llmCfg.provider === 'vllm') {
-        // Route through ST's chat-completions proxy with `chat_completion_source:
-        // 'custom'`. ST reads the real key server-side from SECRET_KEYS.CUSTOM
-        // and forwards to llmCfg.vllmUrl. llmCfg.apiKey here is the MASKED
-        // presence value — never sent over the wire. Same pattern as the
-        // openrouter branch above.
-        endpoint = '/api/backends/chat-completions/generate';
-        headers = getRequestHeaders();
-        requestBody = { chat_completion_source: 'custom', custom_url: llmCfg.vllmUrl, ...body };
-    } else {
-        throw new Error(`Unknown provider: ${llmCfg.provider}`);
-    }
-
-    const response = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    if (!response.ok) {
-        const errText = await response.text().catch(() => response.statusText);
-        const modelConfigError = getModelConfigErrorMessage({
-            contextLabel: 'Agent Mode',
-            provider: llmCfg.provider,
+async function _callPlanner({ systemPrompt, userMessage, llmCfg, timeoutMs, maxTokens }) {
+    // Shared HTTP + response classification (llm-provider-call.js). The planner
+    // is a two-message, json_object call. authBranch:false preserves the prior
+    // behavior of folding 401/403 into the model-config / generic paths (Agent
+    // Mode had no dedicated auth branch — it degrades to pre-search upstream).
+    let content, usage;
+    try {
+        ({ content, usage } = await postChatCompletion({
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage },
+            ],
             model: llmCfg.model,
-            status: response.status,
-            responseText: errText,
-        });
-        if (modelConfigError) {
-            const err = new Error(modelConfigError);
-            err.code = 'invalid_model_config';
+            provider: llmCfg.provider,
+            vllmUrl: llmCfg.vllmUrl || '',
+            maxTokens,
+            temperature: 0.2,
+            timeoutMs,
+            responseFormat: { type: 'json_object' },
+            contextLabel: 'Agent Mode',
+            authBranch: false,
+            ...(llmCfg.parameterStyle || {}),
+        }));
+    } catch (e) {
+        if (e instanceof LlmCallError) {
+            const err = new Error(e.message);
+            if (e.kind === 'model_config') err.code = 'invalid_model_config';
             throw err;
         }
-        throw new Error(`HTTP ${response.status}: ${String(errText).slice(0, 200)}`);
+        throw e;
     }
 
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) {
-        // OpenRouter via ST's proxy can return HTTP 200 with an error body (e.g.
-        // {"message":"Not Found"} for a retired model) instead of a 4xx. Surface that
-        // as a model-config error; a genuinely empty 200 stays the generic error below.
-        const bodyText = data?.error ? JSON.stringify(data.error) : JSON.stringify(data || {});
-        const modelConfigError = getModelConfigErrorMessage({
-            contextLabel: 'Agent Mode',
-            provider: llmCfg.provider,
-            model: llmCfg.model,
-            status: response.status,
-            responseText: bodyText,
-            enforceStatusGate: false,
-        });
-        if (modelConfigError) {
-            const err = new Error(modelConfigError);
-            err.code = 'invalid_model_config';
-            throw err;
-        }
-        throw new Error('LLM returned empty content');
-    }
-
-    // Capture real token usage from the API response (OpenAI/OpenRouter-compatible
-    // schema). Lets the debug log distinguish "long prompt, fast model" from
-    // "short prompt, slow model" — important when diagnosing latency.
-    const usage = data?.usage ? {
-        prompt_tokens: data.usage.prompt_tokens ?? null,
-        completion_tokens: data.usage.completion_tokens ?? null,
-        total_tokens: data.usage.total_tokens ?? null,
-    } : null;
-
+    // A thinking model emits its reasoning BEFORE the JSON — `<think>…</think>{…}`
+    // — and `response_format: json_object` does not stop it. Left in, that leading
+    // block fails JSON.parse and Agent Mode silently drops to pre-search, which is
+    // the shape GitHub issue #18 was reported in. `should_disable_thinking` sends
+    // `reasoning_effort: 'none'`, but that is a REQUEST: plenty of models ignore
+    // it, and a 200 response never proves the parameter took effect. So strip
+    // unconditionally rather than trusting the switch — same reasoning as the
+    // stripReasoningBlocks() docstring, which is already unconditional for
+    // exactly this class of failure.
+    // Runs BEFORE the fence strip: a fenced reply reads ```json…``` only once the
+    // reasoning ahead of it is gone.
+    const withoutReasoning = stripReasoningBlocks(String(content));
     // Some providers wrap in markdown fences despite response_format=json_object.
-    const cleaned = String(content).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const cleaned = withoutReasoning.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
     let parsed;
     try {
         parsed = JSON.parse(cleaned);

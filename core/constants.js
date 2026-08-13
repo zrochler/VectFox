@@ -43,18 +43,66 @@ export const RATE_LIMIT_WINDOW_MS = 60000;
 export const API_TIMEOUT_MS = 30000;
 
 /**
- * Per-turn retrieval timeout in ms (15 seconds). Bounds the read/search path
- * during generation (rearrangeChat -> EventBase retrieval + chunk retrieval) so
- * a hung embedding/query cannot freeze the whole conversation. On timeout the
- * turn proceeds WITHOUT memory injection -- soft Promise.race via
- * AsyncUtils.timeout; the orphaned fetch is reaped later by ST's server-side
- * timeout (read fetches carry no client AbortSignal). Matches the write-side
- * hedge threshold (vector_hedge_after_ms = 15000) for one consistent "too slow"
- * number. Unlike the write path, reads are NOT hedged/retried -- a stalled
- * retrieval fails soft (one turn without memory, self-corrects next message),
- * so a single bounded attempt is the right tradeoff. See dev_helper.md sec 6.8.
+ * DEFAULT per-turn retrieval timeout in ms (15 seconds) -- the fallback for the
+ * user-facing `retrieval_timeout_ms` setting (Core tab -> Retrieval), not the
+ * effective value. Always read the effective budget through
+ * resolveRetrievalTimeoutMs() in core/retrieval-budget.js.
+ *
+ * Bounds the read/search path during generation (rearrangeChat -> EventBase
+ * retrieval + chunk retrieval) so a hung embedding/query cannot freeze the whole
+ * conversation. On timeout the turn proceeds WITHOUT memory injection -- soft
+ * Promise.race via AsyncUtils.timeout; the orphaned fetch is reaped later by
+ * ST's server-side timeout (read fetches carry no client AbortSignal). Matches
+ * the write-side hedge threshold (vector_hedge_after_ms = 15000) for one
+ * consistent "too slow" number. Unlike the write path, reads are NOT
+ * hedged/retried -- a stalled retrieval fails soft (one turn without memory,
+ * self-corrects next message), so a single bounded attempt is the right
+ * tradeoff. See dev_helper.md sec 6.8.
  */
-export const RETRIEVAL_TIMEOUT_MS = 15000;
+export const RETRIEVAL_TIMEOUT_DEFAULT_MS = 15000;
+
+/**
+ * Clamp range for `retrieval_timeout_ms`. The floor keeps a mistyped 1 from
+ * disabling retrieval outright; the ceiling keeps a mistyped 1500000 from
+ * hanging a generation for half an hour. Agent Mode legitimately needs more than
+ * this ceiling and gets it by ADDING its own planner/fanout budget on top --
+ * see agenticRetrievalExtraBudgetMs() in core/retrieval-budget.js.
+ */
+export const RETRIEVAL_TIMEOUT_MIN_MS = 3000;
+export const RETRIEVAL_TIMEOUT_MAX_MS = 120000;
+
+/**
+ * Agent Mode planner/fanout timeout defaults and clamp range. Shared by the
+ * resolvers in core/retrieval-budget.js, the settings defaults in index.js, and
+ * the input bindings in ui/ui-manager.js.
+ *
+ * These were three hand-kept copies of the same numbers, which is how the
+ * planner default (30s) came to exceed the retrieval budget it runs inside (15s)
+ * with nobody noticing -- GitHub issue #16.
+ */
+export const AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS = 30000;
+export const AGENTIC_QUERY_TIMEOUT_DEFAULT_MS = 10000;
+export const AGENTIC_TIMEOUT_MIN_MS = 1000;
+export const AGENTIC_TIMEOUT_MAX_MS = 60000;
+
+/**
+ * Output-token cap for the Agent Mode planner call, and its clamp range.
+ *
+ * The planner emits a small JSON object (a handful of short queries plus
+ * filters), so the default is generous for a non-thinking model. It is NOT
+ * generous for a thinking one: reasoning tokens are charged against the same
+ * cap, so a model that reasons can spend the whole budget thinking and return
+ * truncated or empty content -- which then fails JSON.parse and drops Agent Mode
+ * back to pre-search with only a log line. That is GitHub issue #18, and it is
+ * why this became a user-visible setting instead of the literal 2000 that used
+ * to sit in _callPlanner.
+ *
+ * Default is unchanged from that literal on purpose: exposing the knob must not
+ * silently move anyone's behavior. Raise it if your planner model thinks.
+ */
+export const AGENTIC_MAX_TOKENS_DEFAULT = 2000;
+export const AGENTIC_MAX_TOKENS_MIN = 256;
+export const AGENTIC_MAX_TOKENS_MAX = 32000;
 
 // =============================================================================
 // RETRY CONFIGURATION

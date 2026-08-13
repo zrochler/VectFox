@@ -61,6 +61,7 @@ import {
 import { world_names, loadWorldInfo } from "../../../../world-info.js";
 import { icons } from "./icons.js";
 import StringUtils from "../utils/string-utils.js";
+import { log } from "../core/log.js";
 import { openVisualizer } from "./chunk-visualizer.js";
 import { queryCollection } from "../core/core-vector-api.js";
 import {
@@ -120,7 +121,7 @@ let bulkEventsBound = false;
  */
 export function initializeDatabaseBrowser(settings) {
   browserState.settings = settings;
-  console.log("VECTFOX Database Browser: Initialized");
+  log.lifecycle("VectFox Database Browser: Initialized");
 }
 
 /**
@@ -212,12 +213,15 @@ function createBrowserModal() {
                 <!-- Header -->
                 <div class="vectfox-modal-header">
                     <h3>🗃️ VECTFOX Database Browser</h3>
-                    <div style="display:flex;gap:6px;align-items:center;">
+                    <div class="vectfox-modal-header-actions">
                         <button class="vectfox-btn vectfox-btn-sm" id="vectfox_browser_refresh_scan" title="Probe standard and qdrant backends, update the registry, and remove stale entries">
                             ${icons.refreshCw(14)} Refresh Scan
                         </button>
-                        <button class="vectfox-btn-icon" id="vectfox_browser_close">✕</button>
+                        <button class="vectfox-btn vectfox-btn-sm" id="vectfox_browser_clear_reformat_originals" title="Auto-Reformat retains each source's original text for audit. Clear it to reclaim settings.json space — the accepted chunks themselves are untouched.">
+                            🧹 Clear Auto-Reformat Originals
+                        </button>
                     </div>
+                    <button class="vectfox-btn-icon" id="vectfox_browser_close">✕</button>
                 </div>
 
                 <!-- Plugin Warning Banner (hidden by default, shown when plugin unavailable) -->
@@ -467,6 +471,43 @@ function bindBrowserEvents() {
       toastr.error(`Scan failed: ${err.message}`, "VectFox");
     } finally {
       $btn.prop("disabled", false).html(`${icons.refreshCw(14)} Refresh Scan`);
+    }
+  });
+
+  // Clear Auto-Reformat Originals — maintenance action for reformat-store.js's
+  // retained pre-reformat source text (kept for audit/revert; see reformat-store.js
+  // docstring). Only clears the audit copy, never the accepted chunks/runId, so this
+  // can never affect anything already vectorized.
+  $("#vectfox_browser_clear_reformat_originals").on("click", async function (e) {
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      const { listReformatCacheEntries, clearAllReformatOriginals } = await import("../core/reformat-store.js");
+      const entries = listReformatCacheEntries();
+      const totalBytes = entries.reduce((sum, entry) => sum + entry.originalTextBytes, 0);
+
+      if (totalBytes === 0) {
+        toastr.info("No retained Auto-Reformat originals to clear.", "VectFox");
+        return;
+      }
+
+      const { callGenericPopup, POPUP_TYPE } = await import("../../../../popup.js");
+      const confirmed = await callGenericPopup(
+        `<div style="text-align:left;">
+                    <p><strong>Clear retained Auto-Reformat originals?</strong></p>
+                    <p>${entries.length} source(s), ~${Math.round(totalBytes / 1024)} KB of pre-reformat text.</p>
+                    <p style="margin-top:10px;">This only removes the audit copy of the original source text — the accepted, already-reformatted chunks are untouched and remain usable. You won't be able to review the original wording later.</p>
+                </div>`,
+        POPUP_TYPE.CONFIRM,
+        "",
+        { okButton: "Clear Originals", cancelButton: "Cancel" },
+      );
+      if (!confirmed) return;
+
+      const cleared = clearAllReformatOriginals();
+      toastr.success(`Cleared retained original text for ${cleared} Auto-Reformat entr${cleared === 1 ? "y" : "ies"}.`, "VectFox");
+    } catch (err) {
+      toastr.error(`Failed to clear Auto-Reformat originals: ${err.message}`, "VectFox");
     }
   });
 
@@ -1038,11 +1079,12 @@ function renderCollectionCard(collection, isActiveById = null) {
     ? `<span class="vectfox-badge vectfox-badge-model" title="Current model: ${safeCurrentModelName} (${collection.models.length} available)">📐 ${safeCurrentModelName}</span>`
     : "";
 
-  // Lock badge — show only when locked to the CURRENT chat. Locks to other chats
-  // still exist (visible in the Settings modal as "X lock (other chat)"), but the
+  // Lock badge — show only when a lock matches the CURRENT context. Locks elsewhere
+  // still exist (visible in the Settings modal as "X locks (elsewhere)"), but the
   // listing badge would be misleading there since the collection isn't active here.
-  // The lock badge mirrors the "Active for current chat" checkbox — same source
-  // of truth (isCollectionActiveForContext, bundled into getCollectionListing).
+  // The lock badge mirrors the master-switch checkbox in Collection Settings —
+  // same source of truth (isCollectionActiveForContext, bundled into
+  // getCollectionListing). See syncLockCheckboxToScope() for that checkbox's label.
   // Use registry-key form so the metadata layer keys lock state per-backend.
   // Two collections sharing a bare ID across different backends now report
   // their lock badges independently.
@@ -1059,14 +1101,26 @@ function renderCollectionCard(collection, isActiveById = null) {
   }
   let lockBadge = "";
   if (isActive) {
-    const lockTitle = collection.scope === 'character'
-      ? "Active for current chat (locked to current character)"
-      : (() => {
-          const otherCount = getCollectionLockCount(lockLookupId) - 1;
-          return otherCount > 0
-            ? `Active for current chat (also locked to ${otherCount} other chat${otherCount !== 1 ? "s" : ""})`
-            : "Active for current chat";
-        })();
+    // Report which lock ACTUALLY matched, not which one the scope implies. Gate 2
+    // in shouldCollectionActivate() accepts a chat lock OR a character lock
+    // whatever the collection's scope, so a chat-scoped collection can be active
+    // here through a character lock — and the old title, which branched on scope
+    // alone, would have called that "locked to current character" or not purely by
+    // how the collection was created.
+    const currentChatId = getCurrentChatId();
+    const currentCharacterId = getContext()?.characterId;
+    const viaChat = Boolean(currentChatId && isCollectionLockedToChat(lockLookupId, currentChatId));
+    const viaCharacter = Boolean(isCollectionLockedToCharacter(lockLookupId, currentCharacterId));
+
+    let lockTitle;
+    if (viaChat && viaCharacter) lockTitle = "Active here — locked to this chat and to this character";
+    else if (viaCharacter) lockTitle = "Active here — locked to this character, so it is active in every chat with them";
+    else lockTitle = "Active here — locked to this chat";
+
+    const otherChatCount = getCollectionLockCount(lockLookupId) - (viaChat ? 1 : 0);
+    if (otherChatCount > 0) {
+      lockTitle += ` (also locked to ${otherChatCount} other chat${otherChatCount !== 1 ? "s" : ""})`;
+    }
     lockBadge = `<span class="vectfox-badge vectfox-badge-lock" title="${lockTitle}">🔒</span>`;
   }
 
@@ -1979,20 +2033,28 @@ function createActivationEditorModal() {
         <div id="vectfox_activation_editor_modal" class="vectfox-modal">
             <div class="vectfox-activation-editor">
                 <div class="vectfox-modal-header">
-                                    <h3>⚙️ Collection Settings</h3>
-                                    <div style="display:flex; gap:8px; align-items:center;">
-                                        <button id="vectfox_activation_lock_collection" class="vectfox-btn-sm" title="Lock this collection to the current chat">🔒 Lock to Chat</button>
-                                        <button class="vectfox-btn-icon" id="vectfox_activation_close">✕</button>
-                                    </div>
-                                </div>
+                    <h3>⚙️ Collection Settings</h3>
+                    <div class="vectfox-modal-header-actions">
+                        <button id="vectfox_activation_lock_collection" class="vectfox-btn-sm" title="Manage this collection's chat and character locks">🔒 Manage Locks</button>
+                    </div>
+                    <button class="vectfox-btn-icon" id="vectfox_activation_close">✕</button>
+                </div>
 
                 <div class="vectfox-activation-body">
                     <div class="vectfox-activation-collection-name">
                         Collection: <strong id="vectfox_activation_collection_name"></strong>
                     </div>
 
-                    <!-- Always Active Toggle -->
+                    <!-- ========================================== -->
+                    <!-- REQUIRED: THE LOCK IS THE MASTER SWITCH      -->
+                    <!-- Nothing below activates a collection that is -->
+                    <!-- not locked; triggers/conditions only narrow. -->
+                    <!-- ========================================== -->
                     <div class="vectfox-activation-section vectfox-always-active">
+                        <div class="vectfox-section-header">
+                            <h4>🔒 Lock <span class="vectfox-badge-required">Required</span></h4>
+                            <small>The master switch. A collection that is not locked never activates, whatever else is set below.</small>
+                        </div>
                         <label class="vectfox-checkbox-label">
                             <input type="checkbox" id="vectfox_always_active">
                         <strong id="vectfox_always_active_label">Active for current chat</strong>
@@ -2001,12 +2063,14 @@ function createActivationEditorModal() {
                     </div>
 
                     <!-- ========================================== -->
-                    <!-- PRIMARY: ACTIVATION TRIGGERS (Like Lorebook) -->
+                    <!-- FILTER: ACTIVATION TRIGGERS (Like Lorebook)  -->
+                    <!-- Narrows an already-locked collection. Has no -->
+                    <!-- effect on its own - see the Lock block above. -->
                     <!-- ========================================== -->
                     <div class="vectfox-activation-section vectfox-triggers-section">
                         <div class="vectfox-section-header">
-                            <h4>🎯 Activation Triggers <span class="vectfox-badge-primary">Primary</span></h4>
-                            <small>Simple keyword-based activation, like lorebook entries</small>
+                            <h4>🎯 Activation Triggers <span class="vectfox-badge-primary">Filter</span></h4>
+                            <small>Narrows a locked collection to turns whose recent messages contain a keyword. Leave empty to keep it active on every turn.</small>
                         </div>
 
                         <div class="vectfox-triggers-input">
@@ -2119,14 +2183,15 @@ function createActivationEditorModal() {
 
                     <!-- Activation Priority Info -->
                     <div class="vectfox-activation-info">
-                        <strong>Activation Priority:</strong>
+                        <strong>Activation Chain — every step that applies must pass:</strong>
                         <ol>
-                            <li><strong>Disabled</strong> → Collection never queries (pause kills all activation)</li>
-                            <li><strong>Triggers</strong> → Match keywords in recent messages → activates</li>
-                            <li><strong>Advanced Conditions</strong> → Evaluated if triggers empty/don't match → activates</li>
-                            <li><strong>Active for current chat / Character lock</strong> → Manual always-on</li>
-                            <li><strong>Nothing configured</strong> → Collection does not activate</li>
+                            <li><strong>Disabled</strong> → never queries (pause kills all activation)</li>
+                            <li><strong>Lock</strong> → <em>required</em>. Not locked to this chat or character → does not activate, full stop</li>
+                            <li><strong>Triggers</strong>, if set → a keyword must match recent messages this turn</li>
+                            <li><strong>Advanced Conditions</strong>, if set → the rules must also pass this turn</li>
+                            <li><strong>Locked, nothing else set</strong> → active on every turn</li>
                         </ol>
+                        <small>Triggers and conditions <strong>narrow</strong> a locked collection. They cannot switch one on by themselves.</small>
                     </div>
                 </div>
 
@@ -2177,12 +2242,15 @@ function bindActivationEditorEvents() {
     if (e.target === this) closeActivationEditor();
   });
 
-  // Active-for-current-chat toggle (status only, does not disable other settings)
+  // Master-switch toggle (status only, does not disable other settings).
+  // Its label follows the collection's scope - see syncLockCheckboxToScope().
   $("#vectfox_always_active").on("change", function (e) {
     e.stopPropagation();
   });
 
-  // Activation editor: Lock-to-chat button - opens dialog to manage multiple locks
+  // Activation editor: Manage Locks button - opens the dialog that adds and removes
+  // BOTH chat and character locks. It is the only route to a character lock; the
+  // master-switch checkbox writes just the one lock matching the collection's scope.
   $("#vectfox_activation_lock_collection").off("click").on("click", async function (e) {
     e.stopPropagation();
     const collId = activationEditorState.collectionId;
@@ -2221,6 +2289,45 @@ function bindActivationEditorEvents() {
 }
 
 /**
+ * Points the master-switch checkbox at the lock it actually writes.
+ *
+ * saveActivation() branches on the collection's scope: scope='chat' writes a chat
+ * lock, scope='character' writes a character lock. The checkbox used to say
+ * "Active for current chat" in both cases, so a character-scoped collection (the
+ * default for lorebooks) claimed to affect one chat while switching itself on for
+ * every chat with that character.
+ *
+ * It also went dead without saying so: a character-scoped collection in a group
+ * chat has no characterId, so ticking it saved nothing. Group chats DO have a chat
+ * id, so the 🔒 Manage Locks dialog can still lock them - point the user there
+ * rather than leaving a checkbox that silently does nothing.
+ */
+function syncLockCheckboxToScope(collectionId) {
+  const scope = getCollectionMeta(collectionId)?.scope || "character";
+  const isCharacterScope = scope !== "chat";
+  const hasLockTarget = isCharacterScope
+    ? getContext()?.characterId !== undefined && getContext()?.characterId !== null
+    : Boolean(getCurrentChatId());
+
+  $("#vectfox_always_active_label").text(
+    isCharacterScope ? "Active for current character" : "Active for current chat",
+  );
+
+  let hint;
+  if (!hasLockTarget) {
+    hint = isCharacterScope
+      ? "No active character - group chats have none. Use 🔒 Manage Locks below to lock this collection to the current chat instead."
+      : "No active chat. Open a chat, or use 🔒 Manage Locks below.";
+  } else {
+    hint = isCharacterScope
+      ? "When enabled, this collection is active in every chat with the current character."
+      : "When enabled, this collection is active for the current chat.";
+  }
+  $("#vectfox_always_active_hint").text(hint);
+  $("#vectfox_always_active").prop("disabled", !hasLockTarget);
+}
+
+/**
  * Renders the activation editor content
  */
 function renderActivationEditor() {
@@ -2228,9 +2335,7 @@ function renderActivationEditor() {
 
   $("#vectfox_activation_collection_name").text(state.collectionName);
   $("#vectfox_always_active").prop("checked", state.alwaysActive);
-  $("#vectfox_always_active").prop("disabled", false);
-  $("#vectfox_always_active_label").text("Active for current chat");
-  $("#vectfox_always_active_hint").text("When enabled, this collection is active for the current chat");
+  syncLockCheckboxToScope(state.collectionId);
 
   // Triggers
   const triggersText = state.triggers.join("\n");
@@ -2281,7 +2386,7 @@ function refreshActivationLockButton() {
     if (!$btn || $btn.length === 0) return;
 
     if (!collId) {
-      $btn.prop("disabled", true).text("🔒 Lock to Chat");
+      $btn.prop("disabled", true).text("🔒 Manage Locks");
       $btn.attr("title", "No collection selected");
       return;
     }
@@ -2299,22 +2404,42 @@ function refreshActivationLockButton() {
     if (activationEditorState.collectionId) {
       activationEditorState.alwaysActive = shouldBeActive;
       $("#vectfox_always_active").prop("checked", shouldBeActive);
+      // CHAT_CHANGED can move us between a solo and a group chat, which changes
+      // which lock the checkbox writes - and whether it can write one at all.
+      syncLockCheckboxToScope(collId);
     }
 
     if (totalLocks === 0) {
       $btn.prop("disabled", false).text("🔒 Manage Locks");
       $btn.attr("title", "No locks set. Click to add locks");
     } else {
-      const hasCurrentChatLock = Boolean(isLockedToCurrentChat);
-      const lockedStatus = hasCurrentChatLock ? "🔓" : "🔒";
+      // totalLocks counts BOTH kinds, so the suffix must not name one of them
+      // unless it is the lock that actually matches here. The old label read
+      // "(other chat)" for a collection whose only locks were CHARACTER locks,
+      // sending the user to look for a chat lock that never existed.
+      const isActiveHere = Boolean(isLockedToCurrentChat || isLockedToCurrentChar);
+      const lockedStatus = isActiveHere ? "🔓" : "🔒";
       const lockLabel = `${totalLocks} lock${totalLocks !== 1 ? "s" : ""}`;
-      const scopeLabel = hasCurrentChatLock ? "(this chat)" : "(other chat)";
+      let scopeLabel;
+      if (isLockedToCurrentChat && isLockedToCurrentChar) scopeLabel = "(this chat + character)";
+      else if (isLockedToCurrentChat) scopeLabel = "(this chat)";
+      else if (isLockedToCurrentChar) scopeLabel = "(this character)";
+      else scopeLabel = "(elsewhere)";
       $btn.prop("disabled", false).text(`${lockedStatus} ${lockLabel} ${scopeLabel}`);
 
-      let tooltip = `Collection has ${totalLocks} lock${totalLocks !== 1 ? "s" : ""}`;
-      if (chatLockCount > 0) tooltip += ` (${chatLockCount} chat${chatLockCount !== 1 ? "s" : ""})`;
-      if (charLockCount > 0) tooltip += ` (${charLockCount} character${charLockCount !== 1 ? "s" : ""})`;
-      if (isLockedToCurrentChat || isLockedToCurrentChar) tooltip += " - ACTIVE for current context";
+      const lockBreakdown = [];
+      if (chatLockCount > 0) lockBreakdown.push(`${chatLockCount} chat${chatLockCount !== 1 ? "s" : ""}`);
+      if (charLockCount > 0) lockBreakdown.push(`${charLockCount} character${charLockCount !== 1 ? "s" : ""}`);
+      let tooltip = `Collection has ${totalLocks} lock${totalLocks !== 1 ? "s" : ""}: ${lockBreakdown.join(", ")}.`;
+      tooltip += isActiveHere
+        ? " ACTIVE here — the master switch is on for this context."
+        : " Not active here — none of these locks match the current chat or character.";
+      // A character lock can never match in a group chat (no single active
+      // character), so a collection locked only to characters looks inert there.
+      // Say why, rather than leaving the user to work it out.
+      if (!isActiveHere && charLockCount > 0 && chatLockCount === 0 && !charId) {
+        tooltip += " Only character locks are set, and a group chat has no active character — add a chat lock.";
+      }
 
       $btn.attr("title", tooltip);
     }
@@ -2355,12 +2480,14 @@ function saveActivation() {
   const saveMeta = getCollectionMeta(state.collectionId);
   console.log(`[VectFox] saveActivation: checkbox=${isChecked}, scope=${saveMeta.scope}, chatId=${currentChatId || 'none'}, charId=${currentCharacterId ?? 'none'}, collection=${state.collectionId}`);
 
-  // The "Active for current chat" checkbox controls a single lock keyed by the collection's scope.
-  //   scope='chat'      → chat lock for currentChatId
-  //   scope='character' → character lock for currentCharacterId
+  // The master-switch checkbox controls a single lock keyed by the collection's scope.
+  // syncLockCheckboxToScope() labels it to match, and disables it when the scope's
+  // lock target is missing - so the no-target branches below are backstops.
+  //   scope='chat'      → chat lock for currentChatId       ("Active for current chat")
+  //   scope='character' → character lock for currentCharacterId ("Active for current character")
   if (saveMeta.scope === 'chat') {
     if (!currentChatId) {
-      toastr.info('No active chat context; "Active for current chat" was not changed');
+      toastr.info('No active chat; "Active for current chat" was not changed');
     } else if (isChecked) {
       setCollectionLock(state.collectionId, currentChatId);
     } else {
@@ -2368,7 +2495,7 @@ function saveActivation() {
     }
   } else if (saveMeta.scope === 'character') {
     if (!currentCharacterId) {
-      toastr.info('No active character; "Active for current chat" was not changed');
+      toastr.info('No active character; use 🔒 Manage Locks to lock this collection to the current chat', 'VectFox');
     } else if (isChecked) {
       setCollectionCharacterLock(state.collectionId, String(currentCharacterId));
     } else {
@@ -3666,11 +3793,17 @@ function openCollectionLockDialog(collectionId) {
 
     // Generate hint text for character section
     const charHintClass = currentCharacterId && characterLocks.includes(currentCharacterId) ? 'vectfox-lock-hint vectfox-lock-hint-success' : 'vectfox-lock-hint';
+    // A chat id with no character id means a group chat. Character locks can never
+    // match there — shouldCollectionActivate() only sees a characterId in a solo
+    // chat — so name the reason instead of leaving a dead button unexplained.
+    const isGroupChat = Boolean(currentChatId) && !currentCharacterId;
     const charHintText = currentCharacterId
         ? characterLocks.includes(currentCharacterId)
             ? '✓ Already locked to this character'
             : 'Lock this collection to the current character'
-        : 'No character currently active';
+        : isGroupChat
+            ? 'A group chat has no single active character, so character locks never match here — use a chat lock above.'
+            : 'No character currently active';
 
     const dialogHtml = `
         <div id="vectfox_lock_dialog" class="vectfox-modal" style="display: flex;">

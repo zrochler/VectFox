@@ -173,6 +173,17 @@ EventBase 並沒有*強迫*你使用 Qdrant——A1/A2 輕量路徑可以跑在 
 
 > 💡 把它想成滾動摘要擴充元件唯一真正有用的那件事——*「永遠提醒 AI 剛剛發生了什麼」*——只是改建在 EventBase 的結構化事件上，而不是一坨會遞迴失真的文字摘要。你得到有保證的近期上下文，**卻沒有**那種摧毀細節的反覆再摘要。
 
+#### 👻 幽靈化已向量化訊息 — 摘要注入帶來的省 Token 回報
+
+一旦摘要注入保證近期脈絡永遠都在提示詞裡，*較舊*訊息的原始文字就變得多餘了——那些回合早已存在 EventBase 裡，而上面的結構化回顧也已涵蓋近期的。**幽靈化**就把這份多餘變現：每一回合它保留最近的 N 則訊息原文，並**把所有較舊、已向量化的訊息從送出的提示詞中清空**，讓模型改靠 EventBase 記憶（上面的注入＋語意檢索），而不是為同一段歷史付兩次費。
+
+- **不會破壞任何東西。** 清空只發生在提示詞的拋棄式副本上——你的聊天介面與存檔**完全不受影響**，而且效果**每回合重置**（沒有東西需要還原，切換分支安全）。把滑桿調低，下一回合回顧只是往更早回溯而已。
+- **可擴展到任意聊天長度。**「保留最近 N 則原文」會自動縮放——一段 2,000 則的聊天送出的原文回合數，跟 200 則的差不多，更舊的全部由記憶供應。Token 成本不再隨聊天長度增長。
+- **召回率就是那個旋鈕。** 保留的原文回合越少，AI 就越依賴檢索品質——所以**調低滑桿時請留意你的召回品質**，停在模型仍能清楚跟上場景的位置。
+- **World Info 仍然安全。** 清空有下限保護，絕不會清掉 World Info 需要掃描的訊息；若 WI 可能掃描整段聊天則自動暫停——關鍵字觸發在任何滑桿值下都持續生效。
+
+由於它完全仰賴 EventBase 保持最新，幽靈化**需要開啟摘要注入**（後者又會把自動同步視窗強制設為 1，讓資料庫只落後即時聊天一回合）。在 **AutoSync** 分頁中、摘要注入正下方啟用；預設關閉。
+
 ### 🧠 為什麼它比傳統記憶擴充元件更好
 
 大多數現有記憶擴充元件會採用以下兩種方法之一。而這兩種方法都會在聊天變長後失去細節。原因如下，也能看出 EventBase 是怎麼避開這個問題的：
@@ -469,10 +480,29 @@ CJK 的單字元過濾更完善，並針對高訊號的單字 RPG/日常生活/�
 
 如果你使用 Standard 後端且未安裝插件，事件搜尋與注入仍可正常運作，只是無法進行區塊檢視或使用關鍵字元資料。若追求最佳的檢索品質，**強烈建議使用 Qdrant** —— https://qdrant.tech/ 的免費雲端方案完全不需要本機設定。
 
+#### 第一次在 Windows 上使用？請先安裝 Git 與 Node.js
+
+下面的安裝指令會用到 `git` 和 `npm`。在 Windows 上，你需要先安裝這兩者才能使用。（如果你已經以原始碼方式執行 SillyTavern，就已經有 Node.js/npm —— 可能只需要安裝 Git。）
+
+1. 按下 **Windows 鍵**，輸入 **`cmd`**，再按 **Enter**。會開啟一個黑色的命令提示字元視窗。
+2. 逐一輸入下列兩道指令，每輸入一道就按 **Enter** 並等它跑完：
+
+   ```bat
+   winget install Git.Git
+   winget install OpenJS.NodeJS.LTS
+   ```
+
+   `Git.Git` 提供 `git` 指令；`OpenJS.NodeJS.LTS` 會安裝 Node.js，其中已包含 `npm`。`winget` 內建於 Windows 10/11，不需額外安裝。
+3. **關閉命令提示字元，再重新開啟一個新的**（重複步驟 1），讓新指令生效。
+4. 驗證：輸入 `git --version` 再輸入 `npm --version`，兩者都應該顯示版本號。
+
+> 在 **Linux/Mac** 上，請改用套件管理員安裝 Git 與 Node.js（例如 `sudo apt install git nodejs npm`，或 `brew install git node`）。
+
 #### 插件安裝說明：
 
+開啟命令提示字元（Windows）/ 終端機（Linux/Mac）/ Console（Docker），然後執行：
+
 ```bash
-在 Windows 上開啟命令提示字元，或在 Linux/Mac 上開啟終端機；如果你是在 docker 上，請進入 Console
 cd SillyTavern/plugins
 git clone -b Similharity-Plugin https://github.com/KritBlade/VectFox.git similharity
 cd similharity
@@ -483,6 +513,9 @@ npm install
 ```yaml
 enableServerPlugins: true
 ```
+
+> 📌 **用上面的 `git clone` 安裝，是插件能持續自動更新的前提。** 下載 ZIP 則無法自動更新，而在不知情的狀況下一直使用舊版插件，是最常見、也最難追查的問題來源。確認是否正常運作請見 [🔄 自動更新](#-自動更新)。
+
 重啟 SillyTavern。
 
 ### 步驟 3：設定 VectFox
@@ -505,11 +538,26 @@ enableServerPlugins: true
 
 ## 🔄 自動更新
 
-VectFox 的 manifest 中設定了 `auto_update: true`。如果你是透過 `git clone` 安裝，SillyTavern 會自動檢查並套用更新！
+VectFox 由**兩個各自獨立更新的部分**組成：擴充功能（本儲存庫）與 Similharity 伺服器插件（上方步驟 2）。更新其中一邊並不會連帶更新另一邊；舊版插件搭配新版擴充功能是我們沒有測試過的組合，會造成難以追查的異常。請務必讓兩邊都保持最新。
+
+### 擴充功能
+
+VectFox 的 manifest 中設定了 `auto_update: true`。如果你是透過 `git clone` 安裝，SillyTavern 會自動檢查並套用更新。
 
 請留意 Extensions 面板中的更新通知，或使用「Check for Updates」按鈕手動檢查。
 
-Qdrant 後端需要將 enableServerPlugin 設為 true。
+### Similharity 插件
+
+**如果你是透過 `git clone` 安裝插件（上方步驟 2）**，每次重啟 SillyTavern 時它都會自動更新——SillyTavern 啟動時會對每個屬於 git 儲存庫的插件資料夾執行 `git pull`。此功能預設為開啟。
+
+
+**如果你是下載 ZIP 安裝插件**，因為沒有 `.git` 資料夾可供 SillyTavern 拉取，自動更新將**無法運作**。這是插件在你不知情的情況下停留在舊版本最常見的原因。修正方式：
+
+1. 刪除 `SillyTavern/plugins/similharity` 資料夾。
+2. 依照上方步驟 2 以 `git clone` 重新安裝。
+3. 你的設定與已向量化的資料存放在別處，不會受到影響。
+
+> ⚠️ **這兩個伺服器插件相關設定都請保持開啟。** `enableServerPlugins: true` 是 Qdrant 後端的必要設定，Standard 後端上任何需要插件的功能同樣需要它。`enableServerPluginsAutoUpdate` 是另一個設定，預設為 `true` — 請維持原樣。一旦關閉，擴充功能會繼續更新，插件卻會停留在你當初安裝的版本，而且不會有任何提示告訴你它已經過舊。你只會在日後才發現：某個你從未收到的插件更新導致了問題，而那時要追查真正的原因會非常困難。
 
 ---
 
@@ -568,6 +616,21 @@ VectFox + Similharity 是為**個人使用設計的** — 適合在自己的機�
 對沖（Hedge）解決了這個問題。如果一個請求在時限（15 秒）內沒有回應，VectFox 會在**不取消第一個請求**的前提下，悄悄用**一條新連線發出第二個完全相同的請求**。哪個先回傳就用哪個，輸的那個被丟棄。新連線通常會被路由到*健康*的工作程序，所以你能在幾秒內恢復，而不必乾等整個逾時。（把同一段文字發兩次是無害的——重複只會用相同的資料覆寫資料庫裡的同一筆記錄。）
 
 > 💡 保持開啟即可。它只在事情已經出問題時才會觸發，能大幅減輕不穩定雲端提供者帶來的痛苦。對於**本機**模型（Ollama、Transformers、llama.cpp、KoboldCpp）會自動跳過（新建連線也改變不了路由）。設為 `0` 可關閉。
+
+**要怎麼把 NanoGPT 設定為提供者？**
+首先把提供者選為 **vLLM**——那是相容於 OpenAI、會顯示 NanoGPT 所需自訂 URL 欄位的選項。接著嵌入端點與摘要端點需要*不同*的設定方式；同一個 base URL 無法同時用於兩者。以下設定由 Reddit 使用者 **[u/aturbofrog](https://www.reddit.com/user/aturbofrog/)** 提供：
+
+| 設定                | 值                                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------------- |
+| **嵌入 URL**        | `https://nano-gpt.com/api/v1/embeddings` — 必須使用完整路徑；單用 base URL 會失敗               |
+| **嵌入模型**        | `Qwen/Qwen3-Embedding-8B`                                                                       |
+| **摘要 URL**        | `https://nano-gpt.com/api/v1/` — 維持 base 即可；附加 `chat/completions` 反而會莫名測試失敗     |
+| **摘要模型**        | `nvidia/nemotron-3-ultra-550b-a55b`（或任何你偏好的聊天模型）                                    |
+
+兩個注意事項：
+
+- **啟用付費模型。** 為了讓嵌入通過 VectFox 的連線測試，請在你的 NanoGPT 帳號設定中開啟 **「Enable paid models on API」**。
+- **輸出 token 為零是正常的。** NanoGPT 用量頁面對每次嵌入執行都顯示**零輸出 token**——這是預期行為（嵌入不會產生輸出 token），並不代表有任何問題。
 
 ---
 

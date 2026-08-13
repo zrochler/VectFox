@@ -50,8 +50,8 @@ import { existsSync } from 'fs';
 // This override only affects THIS test file — it doesn't mutate the config
 // for any other suite.
 // ---------------------------------------------------------------------------
-//const TEST_TARGET_URL = null;
-const TEST_TARGET_URL = 'http://localhost:8000';
+const TEST_TARGET_URL = null;
+//const TEST_TARGET_URL = 'http://localhost:8000';
 
 if (TEST_TARGET_URL) {
     test.use({ baseURL: TEST_TARGET_URL });
@@ -4083,6 +4083,278 @@ test('TEST 022 — Standard+plugin: context/xmlTag wrapping + condition filter t
                 }
             } catch (cleanupErr) { console.warn(`${TEST} [WARN] Cleanup failed: ${cleanupErr.message}`); }
         }
+    });
+    assertPassed(logs);
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TEST 023 — Auto-sync settle/commit lag: re-rolls on the active turn
+//             never extract; the kept turn extracts once superseded
+// ═══════════════════════════════════════════════════════════════════
+//
+// Why this test exists:
+//   Auto-sync fires on MESSAGE_SWIPED. Without the settle-lag, every swipe of
+//   the latest AI reply rewrites .mes → new hash → new window fingerprint →
+//   a fresh extraction, leaving one embedding per discarded generation.
+//
+//   The settle/commit lag (getCommitBoundary) holds the active last turn back:
+//   the window-builder, the quick-exit, and the LED all evaluate against the
+//   COMMITTED slice = messages minus the last auto-sync window. So a swipe on
+//   the active turn changes only messages beyond the boundary → the committed
+//   slice is unchanged → no re-extraction. Once the user sends a newer turn,
+//   the previously-active turn falls inside the boundary and extracts exactly
+//   once. See plans/autosync-settle-lag.md.
+//
+// What it proves (using the SAME real functions the ingestion loop uses):
+//   - getCommitBoundary holds back exactly one turn by default, none when off.
+//   - A swipe on the active turn leaves the committed quick-exit "done" (no work).
+//   - Superseding the turn flips the committed quick-exit to "work pending" so
+//     the kept turn extracts.
+test('TEST 023 — Auto-sync settle/commit lag: swipes on active turn never extract', async () => {
+    const logs = await runTestInPage(async () => {
+        const TEST = 'TEST 023 [SettleLag]';
+        const base = '/scripts/extensions/third-party/VectFox/';
+        const { getCommitBoundary, getAutoSyncWindowSize } = await import(base + 'core/eventbase-workflow.js');
+        const { markWindowExtracted, isLastWindowExtracted, clearWindowCacheForChat } = await import(base + 'core/eventbase-store.js');
+        const { extension_settings } = await import('/scripts/extensions.js');
+
+        const testUUID = '__vf_playwright_test_023__settle_lag';
+        const windowSize = 2, step = 2;
+
+        // 8-message chat (4 turns). hashes are arbitrary-but-stable per message.
+        const messages = [
+            { mes: 'human 0', name: 'You' }, { mes: 'ai 0', name: 'AI' },
+            { mes: 'human 1', name: 'You' }, { mes: 'ai 1', name: 'AI' },
+            { mes: 'human 2', name: 'You' }, { mes: 'ai 2', name: 'AI' },
+            { mes: 'human 3', name: 'You' }, { mes: 'ai 3', name: 'AI' },
+        ];
+        const hashes = [100, 200, 300, 400, 500, 600, 700, 800];
+        const hashFn = (m) => hashes[messages.indexOf(m)];
+
+        try {
+            // ═══ Phase 1 — boundary math: hold back exactly one turn ═══
+            const chat6 = messages.slice(0, 6); // chat currently 6 messages (3 turns)
+            const win = getAutoSyncWindowSize({});
+            const boundary6 = getCommitBoundary(chat6, {});
+            if (win !== 2) { console.error(`${TEST} [FAIL] Phase 1: auto-sync window=${win}, expected 2`); return; }
+            if (boundary6 !== 4) { console.error(`${TEST} [FAIL] Phase 1: commitBoundary=${boundary6} for 6 msgs, expected 4 (last turn held)`); return; }
+            if (getCommitBoundary(chat6, { eventbase_autosync_settle_lag: false }) !== 6) {
+                console.error(`${TEST} [FAIL] Phase 1: lag-off boundary should equal full length 6`); return;
+            }
+            console.log(`${TEST} Phase 1 ✓ commitBoundary holds back exactly one turn (6→4), off→6`);
+
+            // ═══ Phase 2 — committed windows extracted → quick-exit reports DONE ═══
+            // The held-back turn [4-5] is intentionally NOT marked.
+            markWindowExtracted([hashes[0], hashes[1]], testUUID);
+            markWindowExtracted([hashes[2], hashes[3]], testUUID);
+            const committed6 = chat6.slice(0, boundary6); // msgs 0..3
+            if (!isLastWindowExtracted(committed6, windowSize, step, testUUID, hashFn)) {
+                console.error(`${TEST} [FAIL] Phase 2: committed quick-exit reports work pending, but all committed windows are marked → LED would stick yellow`); return;
+            }
+            console.log(`${TEST} Phase 2 ✓ committed slice fully extracted → quick-exit DONE (LED green)`);
+
+            // ═══ Phase 3 — SWIPE the active last turn (msg 5) ═══
+            // Re-roll rewrites the AI reply text → new hash. The active turn is
+            // beyond the boundary, so the committed slice is untouched and no
+            // re-extraction is triggered. This is the anti-duplicate property.
+            messages[5] = { mes: 'ai 2 (re-rolled)', name: 'AI' };
+            hashes[5] = 99999; // swipe → different hash
+            const boundaryAfterSwipe = getCommitBoundary(messages.slice(0, 6), {});
+            if (boundaryAfterSwipe !== 4) { console.error(`${TEST} [FAIL] Phase 3: boundary changed to ${boundaryAfterSwipe} after swipe, expected still 4`); return; }
+            const committedAfterSwipe = messages.slice(0, 6).slice(0, boundaryAfterSwipe);
+            if (!isLastWindowExtracted(committedAfterSwipe, windowSize, step, testUUID, hashFn)) {
+                console.error(`${TEST} [FAIL] Phase 3: swipe on the active turn flipped committed quick-exit to "work pending" — it would re-extract a discarded generation`); return;
+            }
+            console.log(`${TEST} Phase 3 ✓ swipe on active turn leaves committed slice unchanged → NO re-extraction`);
+
+            // ═══ Phase 4 — SUPERSEDE: user sends the next turn (chat → 8 msgs) ═══
+            // The previously-active turn [4-5] now falls inside the boundary and
+            // must extract. Quick-exit on the new committed slice reports pending
+            // because window [4-5] was never marked.
+            const boundary8 = getCommitBoundary(messages, {});
+            if (boundary8 !== 6) { console.error(`${TEST} [FAIL] Phase 4: commitBoundary=${boundary8} for 8 msgs, expected 6`); return; }
+            const committed8 = messages.slice(0, boundary8); // msgs 0..5 — now includes the kept turn
+            if (isLastWindowExtracted(committed8, windowSize, step, testUUID, hashFn)) {
+                console.error(`${TEST} [FAIL] Phase 4: after superseding, committed quick-exit reports DONE — the kept turn [4-5] would never extract`); return;
+            }
+            console.log(`${TEST} Phase 4 ✓ superseded turn now inside boundary → quick-exit reports the kept turn pending`);
+
+            console.log(`${TEST} [PASS] Settle-lag holds the active turn: swipes never extract, the kept turn extracts once superseded`);
+        } finally {
+            try {
+                clearWindowCacheForChat(testUUID);
+                const after = extension_settings?.vectfox?.eventbase_extracted_windows?.[testUUID];
+                if (after !== undefined) console.warn(`${TEST} [WARN] clearWindowCacheForChat left a stale entry: ${JSON.stringify(after)}`);
+                else console.log(`${TEST} Cleanup ✓ fingerprint cache cleared for ${testUUID}`);
+            } catch (cleanupErr) { console.warn(`${TEST} [WARN] Cleanup failed: ${cleanupErr.message}`); }
+        }
+    });
+    assertPassed(logs);
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+// TESTS 024–026 — LLM-call path coverage (postChatCompletion)
+// ═══════════════════════════════════════════════════════════════════
+// TESTS 001–023 use SYNTHETIC inserts — they never touch the chat-completions
+// wire path. These three exercise the real path introduced when the four LLM
+// features (summarizer / EventBase / agentic / Auto-Reformat) were unified onto
+// core/llm-provider-call.js (postChatCompletion + parseJsonArrayFromLlm):
+//
+//   024  EventBase LLM extraction — real provider round-trip + parse/validate
+//   025  Auto-Reformat            — real provider, multi-entity split
+//   026  Acronym glossary         — pure, deployed-module smoke (no LLM)
+//
+// 024/025 make REAL LLM calls (cost tokens + a few seconds each). They soft-
+// SKIP when no summarization model is configured (Core → LLM Summarization),
+// so a box without a chat model keeps the serial suite moving. 026 is
+// deterministic and always runs.
+// ═══════════════════════════════════════════════════════════════════
+
+test('TEST 024 — EventBase LLM extraction: real provider round-trip (postChatCompletion)', async () => {
+    const logs = await runTestInPage(async () => {
+        const TEST = 'TEST 024 [LLMExtract]';
+        const base = '/scripts/extensions/third-party/VectFox/';
+        const { extractEvents } = await import(base + 'core/eventbase-extractor.js');
+        const { extension_settings } = await import('/scripts/extensions.js');
+
+        const vf = extension_settings?.vectfox;
+        if (!vf) { console.error(`${TEST} [FAIL] VectFox settings not found`); return; }
+
+        // Real extraction needs a summarization model. Soft-skip (not fail) when
+        // absent so the serial suite continues on boxes with no chat model set.
+        const provider = (vf.chat_provider || 'openrouter').toLowerCase();
+        const model = (vf.chat_model || '').trim();
+        if (!model) { console.warn(`${TEST} [SKIP] no chat_model configured (Core → LLM Summarization) — cannot exercise real extraction`); return; }
+        if (provider === 'vllm' && !(vf.chat_vllm_url || '').trim()) { console.warn(`${TEST} [SKIP] provider=vllm but no chat_vllm_url configured`); return; }
+
+        // Synthetic 2-message window with two unmistakable events (a kill + an
+        // item pickup) so any competent model yields ≥1 event regardless of tuning.
+        const messages = [
+            { name: 'Klein', is_user: true, mes: 'Klein drew his iron sword and charged the frost wolf blocking the Hollow Bridge, cutting it down after a brief, fierce struggle.' },
+            { name: 'Narrator', is_user: false, mes: 'With the wolf dead, Klein pried a glowing Moonstone Shard loose from the ice where it had fallen and pocketed it.' },
+        ];
+
+        console.log(`${TEST} Extracting via real ${provider}/${model} (2-message window)...`);
+        let events;
+        try {
+            events = await extractEvents({ messages, windowStart: 0, windowEnd: 1, settings: vf, windowIndex: 0 });
+        } catch (err) {
+            console.error(`${TEST} [FAIL] extractEvents threw (${provider}/${model}): ${err.message}`);
+            return;
+        }
+
+        if (!Array.isArray(events)) { console.error(`${TEST} [FAIL] extractEvents did not return an array`); return; }
+        if (events.length === 0) {
+            console.error(`${TEST} [FAIL] 0 events for a window with two clear events — the postChatCompletion or parseJsonArrayFromLlm path may be broken`);
+            return;
+        }
+
+        // Confirm the shared parse + schema-validate path produced well-formed records.
+        const bad = events.find(e => !e.event_type || !e.summary || typeof e.importance !== 'number');
+        if (bad) { console.error(`${TEST} [FAIL] event missing event_type/summary/importance: ${JSON.stringify(bad).slice(0, 200)}`); return; }
+
+        events.slice(0, 5).forEach((e, i) => console.log(`  event[${i}] type="${e.event_type}" imp=${e.importance} summary="${(e.summary || '').slice(0, 60)}"`));
+        console.log(`${TEST} [PASS] real ${provider} extraction via postChatCompletion → ${events.length} valid event(s)`);
+    });
+    assertPassed(logs);
+});
+
+
+test('TEST 025 — Auto-Reformat: real provider splits multi-entity section', async () => {
+    const logs = await runTestInPage(async () => {
+        const TEST = 'TEST 025 [Reformat]';
+        const base = '/scripts/extensions/third-party/VectFox/';
+        const { reformatDocument } = await import(base + 'core/reformat-extractor.js');
+        const { extension_settings } = await import('/scripts/extensions.js');
+
+        const vf = extension_settings?.vectfox;
+        if (!vf) { console.error(`${TEST} [FAIL] VectFox settings not found`); return; }
+
+        // Same inherit chain as extraction: reformat_* → chat_* (Core → LLM Summarization).
+        const provider = (vf.reformat_provider || vf.chat_provider || 'openrouter').toLowerCase();
+        const model = (vf.reformat_model || vf.chat_model || '').trim();
+        if (!model) { console.warn(`${TEST} [SKIP] no reformat_model/chat_model configured — cannot exercise Auto-Reformat`); return; }
+        if (provider === 'vllm' && !(vf.reformat_vllm_url || vf.chat_vllm_url || '').trim()) { console.warn(`${TEST} [SKIP] provider=vllm but no vLLM URL configured`); return; }
+
+        // The exact bug Auto-Reformat targets: two distinct named entities under ONE
+        // heading — mechanical chunking would collapse them into one diluted chunk.
+        const doc = [
+            '## Northern Watch Roster',
+            '',
+            '**Kaelen Frost** — A veteran ranger of the Northern Watch. He wields a yew longbow and tracks quarry by scent-memory, a rare gift among the Watch.',
+            '',
+            '**Mira Solveig** — Quartermaster of the Northern Watch. She keeps the ledgers and the armory, distrusts outsiders, but never forgets a debt.',
+        ].join('\n');
+
+        console.log(`${TEST} Reformatting a 2-entity section via real ${provider}/${model}...`);
+        let result;
+        try {
+            result = await reformatDocument({ text: doc, contentType: 'document', settings: vf });
+        } catch (err) {
+            console.error(`${TEST} [FAIL] reformatDocument threw (${provider}/${model}): ${err.message}`);
+            return;
+        }
+
+        const chunks = result?.chunks || [];
+        if (result?.warnings?.length) console.warn(`${TEST} warnings: ${result.warnings.join(' | ')}`);
+        if (chunks.length === 0) { console.error(`${TEST} [FAIL] Auto-Reformat produced 0 chunks — postChatCompletion/parse path may be broken`); return; }
+
+        // Core value: the two entities got their OWN records, not one merged blob.
+        if (chunks.length < 2) { console.error(`${TEST} [FAIL] expected ≥2 records (one per named entity), got ${chunks.length} — split did not happen`); return; }
+
+        const badShape = chunks.find(c => !c.entry_type || !c.name || !c.body);
+        if (badShape) { console.error(`${TEST} [FAIL] record missing entry_type/name/body: ${JSON.stringify(badShape).slice(0, 200)}`); return; }
+
+        chunks.slice(0, 6).forEach((c, i) => console.log(`  record[${i}] type="${c.entry_type}" name="${c.name}" grounded=${c._nameGrounded !== false} body="${(c.body || '').slice(0, 50)}..."`));
+
+        // Soft signal: both source names should surface somewhere (verbatim-fact rule).
+        const blob = chunks.map(c => `${c.name} ${c.body}`).join(' ').toLowerCase();
+        const foundKaelen = blob.includes('kaelen');
+        const foundMira = blob.includes('mira');
+        if (!foundKaelen || !foundMira) {
+            console.warn(`${TEST} [WARN] one source name missing from output (kaelen=${foundKaelen}, mira=${foundMira}) — model paraphrased; split still succeeded`);
+        }
+
+        console.log(`${TEST} [PASS] real ${provider} Auto-Reformat via postChatCompletion → ${chunks.length} well-formed record(s), multi-entity split confirmed`);
+    });
+    assertPassed(logs);
+});
+
+
+test('TEST 026 — Acronym glossary: deployed-module grounding smoke (no LLM)', async () => {
+    const logs = await runTestInPage(async () => {
+        const TEST = 'TEST 026 [Glossary]';
+        const base = '/scripts/extensions/third-party/VectFox/';
+        const { extractGlossary, injectGlossary } = await import(base + 'core/glossary-extractor.js');
+
+        // A document that defines an acronym once, then uses it bare elsewhere.
+        const source = [
+            'The Federal Hero Oversight Bureau (FHOB) licenses every sanctioned cape in the republic.',
+            '',
+            'Threat assessments are filed to the FHOB within an hour of any incident.',
+        ].join('\n');
+
+        const glossary = extractGlossary(source);
+        const fhob = glossary.find(g => g.acronym === 'FHOB');
+        if (!fhob) { console.error(`${TEST} [FAIL] extractGlossary did not detect "Federal Hero Oversight Bureau (FHOB)" — found: ${JSON.stringify(glossary)}`); return; }
+        if (!/Federal Hero Oversight Bureau/i.test(fhob.fullName || '')) { console.error(`${TEST} [FAIL] FHOB fullName wrong: "${fhob.fullName}"`); return; }
+        console.log(`  detected ${glossary.length} acronym(s): ${glossary.map(g => g.acronym).join(', ')}`);
+
+        // A chunk that uses the bare acronym without its definition must get grounded.
+        const chunks = [{ text: 'Threat assessments are filed to the FHOB within an hour of any incident.', metadata: {} }];
+        const out = injectGlossary(chunks, glossary);
+        if (!Array.isArray(out) || out.length !== 1) { console.error(`${TEST} [FAIL] injectGlossary returned malformed output`); return; }
+        if (!/Federal Hero Oversight Bureau/i.test(out[0].text)) {
+            console.error(`${TEST} [FAIL] definition NOT prepended to the bare-acronym chunk: "${out[0].text.slice(0, 120)}"`);
+            return;
+        }
+        // Non-mutating contract: original input chunk untouched.
+        if (/Federal Hero Oversight Bureau/i.test(chunks[0].text)) { console.error(`${TEST} [FAIL] injectGlossary mutated the input chunk`); return; }
+
+        console.log(`  grounded chunk preview: "${out[0].text.slice(0, 90)}..."`);
+        console.log(`${TEST} [PASS] deployed glossary module grounds a bare acronym (definition prepended, input untouched)`);
     });
     assertPassed(logs);
 });

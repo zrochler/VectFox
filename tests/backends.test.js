@@ -51,6 +51,25 @@ vi.mock('../../../../secrets.js', () => ({
     secret_state: {},
 }));
 
+// Mock collection-loader.js: StandardBackend.initialize() now detects the
+// plugin via the canonical checkPluginAvailable() (dynamically imported) instead
+// of its own /health probe. Stub it at the unit boundary so these tests drive
+// availability through the same fetchMock /health response they always have,
+// without loading the real collection-loader dependency graph. The stub keeps
+// the historical `response.ok` semantics and the single-arg /health call the
+// existing assertions expect.
+vi.mock('../core/collection-loader.js', () => ({
+    checkPluginAvailable: vi.fn(async () => {
+        try {
+            const r = await fetch('/api/plugins/similharity/health');
+            return !!r?.ok;
+        } catch {
+            return false;
+        }
+    }),
+    resetPluginAvailableCache: vi.fn(),
+}));
+
 // Mock providers.js
 vi.mock('../core/providers.js', () => ({
     getModelField: vi.fn((source) => {
@@ -68,6 +87,17 @@ vi.mock('../core/providers.js', () => ({
 // Mock constants.js
 vi.mock('../core/constants.js', () => ({
     VECTOR_LIST_LIMIT: 10000,
+    // Reached via backends -> embedding-latency-warning -> retrieval-budget,
+    // which derives its slow-embed log threshold from the retrieval budget.
+    // All seven are required: retrieval-budget.js imports them by name, and a
+    // mock factory that omits one makes the import throw.
+    RETRIEVAL_TIMEOUT_DEFAULT_MS: 15000,
+    RETRIEVAL_TIMEOUT_MIN_MS: 3000,
+    RETRIEVAL_TIMEOUT_MAX_MS: 120000,
+    AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS: 30000,
+    AGENTIC_QUERY_TIMEOUT_DEFAULT_MS: 10000,
+    AGENTIC_TIMEOUT_MIN_MS: 1000,
+    AGENTIC_TIMEOUT_MAX_MS: 60000,
 }));
 
 // Import backends after mocks are set up
@@ -109,11 +139,11 @@ function mockFetchError(status, message) {
  * Default test settings
  */
 const defaultSettings = {
-    source: 'transformers',
+    embedding_provider: 'transformers',
     score_threshold: 0.25,
     openai_model: 'text-embedding-ada-002',
     cohere_model: 'embed-english-v3.0',
-    ollama_model: 'mxbai-embed-large',
+    embedding_ollama_model: 'mxbai-embed-large',
 };
 
 /**
@@ -609,13 +639,20 @@ describe('QdrantBackend', () => {
     });
 
     describe('hybridQuery', () => {
-        it('should call hybrid endpoint with options', async () => {
-            // hybridQuery now makes a sentinel-metadata fetch first (tokenizer-lock check),
-            // then the hybrid-query fetch.
+        // Call order per hybridQuery: sentinel-metadata fetch (tokenizer-lock
+        // check) → /get-embedding (embed ONCE, vector reused by both queries) →
+        // dense /chunks/query (cosine-gate lookup, fired in parallel) →
+        // /chunks/hybrid-query. The dense fetch lands before the hybrid fetch
+        // because its promise is created first.
+        it('should call hybrid endpoint with options and report cosine as the score', async () => {
             fetchMock
-                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true })) // sentinel: no lock
+                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true }))      // sentinel: no lock
+                .mockResolvedValueOnce(mockFetchResponse({ embedding: [0.1, 0.2, 0.3] }))          // get-embedding
                 .mockResolvedValueOnce(mockFetchResponse({
-                    results: [{ hash: 12345, text: 'Result', score: 0.9 }],
+                    results: [{ hash: 12345, text: 'Result', score: 0.87 }],                       // dense: cosine
+                }))
+                .mockResolvedValueOnce(mockFetchResponse({
+                    results: [{ hash: 12345, text: 'Result', score: 0.016 }],                      // hybrid: raw RRF
                 }));
 
             const result = await backend.hybridQuery('test-collection', 'search', 5, defaultSettings, {
@@ -629,19 +666,46 @@ describe('QdrantBackend', () => {
                 expect.any(Object)
             );
             expect(result.metadata[0].hybridSearch).toBe(true);
+            // score is the cosine from the dense lookup — thresholds downstream
+            // gate on similarity; the rank-derived RRF value moves to fusionScore.
+            expect(result.metadata[0].score).toBeCloseTo(0.87, 5);
+            expect(result.metadata[0].fusionScore).toBeCloseTo(0.016, 5);
         });
 
-        it('should fallback to regular query on hybrid failure', async () => {
+        it('should throw on hybrid failure instead of retrying vector-only itself', async () => {
+            // Degradation for the hybrid path belongs to core/hybrid-search.js and
+            // lives there ONCE. This method used to retry vector-only on its own
+            // before that catch ran, so a single failure cost three HTTP calls
+            // (hybrid-query → this retry → hybrid-search's client-side query) and
+            // still handed the caller an empty set it could not tell apart from
+            // "no match". See GitHub issue #11.
             fetchMock
-                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true })) // sentinel
-                .mockResolvedValueOnce(mockFetchError(404, 'Hybrid not available'))            // hybrid fails
-                .mockResolvedValueOnce(mockFetchResponse({                                     // queryCollection fallback
-                    results: [{ hash: 12345, text: 'Result', score: 0.9 }],
-                }));
+                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true }))      // sentinel
+                .mockResolvedValueOnce(mockFetchResponse({ embedding: [0.1, 0.2, 0.3] }))          // get-embedding
+                .mockResolvedValueOnce(mockFetchResponse({ results: [] }))                         // dense cosine lookup
+                .mockResolvedValueOnce(mockFetchError(404, 'Hybrid not available'));               // hybrid fails
+
+            await expect(backend.hybridQuery('test-collection', 'search', 5, defaultSettings))
+                .rejects.toThrow('Hybrid query failed');
+
+            // Exactly four calls: sentinel, embed, cosine lookup, failed hybrid.
+            // A FIFTH would mean the removed internal vector-only retry came back
+            // (the cosine lookup is part of the happy path, not a retry).
+            expect(fetchMock).toHaveBeenCalledTimes(4);
+        });
+
+        it('should still return empty (not throw) on a dimension mismatch', async () => {
+            // Deliberate dead end rather than a fallback: the same mismatch fails on
+            // every path, and _warnDimensionMismatch has already told the user.
+            fetchMock
+                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true }))
+                .mockResolvedValueOnce(mockFetchResponse({ embedding: [0.1, 0.2, 0.3] }))
+                .mockResolvedValueOnce(mockFetchError(400, 'Vector dimension error: expected dim: 1024, got 768'))  // dense hits it too
+                .mockResolvedValueOnce(mockFetchError(400, 'Vector dimension error: expected dim: 1024, got 768'));
 
             const result = await backend.hybridQuery('test-collection', 'search', 5, defaultSettings);
 
-            expect(result.hashes).toEqual([12345]);
+            expect(result).toEqual({ hashes: [], metadata: [] });
         });
     });
 });

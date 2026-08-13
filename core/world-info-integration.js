@@ -14,14 +14,25 @@ import { extension_settings, getContext } from '../../../../extensions.js';
 import { queryCollection } from './core-vector-api.js';
 import { resolveBackendForCollection, sanitizeNameSegment } from './collection-ids.js';
 import { getCollectionListing, getCollectionRegistry } from './collection-loader.js';
-import { getCollectionMeta, isCollectionEnabled, shouldCollectionActivate } from './collection-metadata.js';
+import {
+    getCollectionMeta,
+    isCollectionEnabled,
+    shouldCollectionActivate,
+    getCollectionLockCount,
+    getCollectionCharacterLockCount,
+    isCollectionLockedToChat,
+    isCollectionLockedToCharacter,
+} from './collection-metadata.js';
 import { LOREBOOK_PROMPT_TAG } from './constants.js';
+import { notifyRetrievalFailure, notifyNoActiveCollections } from './model-config-notifier.js';
+import { runBoundedRetrieval } from './bounded-retrieval.js';
 import { detectLorebookRenames, showLorebookRenameModal, openDatabaseBrowserForRename } from './lorebook-rename-detector.js';
 // Lorebook collection ID lookup uses registry scan (see _findLorebookRegistryEntry below);
 // the builder is intentionally not imported here because lookups can't reconstruct the
 // exact ID (backend + handle + timestamp segments are not known at lookup time).
 import { eventSource, event_types, setExtensionPrompt, substituteParams, getCurrentChatId } from '../../../../../script.js';
 import { log } from './log.js';
+import { isVectFoxEnabled } from './feature-gate.js';
 
 // ============================================================================
 // WORLD INFO ACTIVATION HOOKS
@@ -75,7 +86,12 @@ export async function getSemanticWorldInfoEntries(recentMessages, activeEntries,
     log.verbose(`VectFox: Querying vectorized lorebooks for semantic WI activation${dualQuery ? ' (dual query)' : ''}...`);
 
     const semanticEntries = [];
-    // Lower threshold for hybrid retrieval since RRF/weighted fusion produces lower absolute scores
+    // Scores are 0-1 similarities on EVERY path: Vectra returns cosine, the
+    // Qdrant native hybrid attaches cosine via its dense-lookup gate (see
+    // backends/qdrant.js::hybridQuery — raw RRF fused scores are ≈0.016 and
+    // made this threshold drop everything), and client-side hybrid returns the
+    // 0-1 blend from hybrid-search.js. The 0.8 discount below compensates for
+    // the mild depression hybrid blending applies relative to pure cosine.
     const baseThreshold = settings.world_info_threshold || 0.3;
     const supportsNativeHybrid = settings.vector_backend === 'qdrant';
     const preferNative = settings.hybrid_native_prefer !== false;
@@ -84,7 +100,8 @@ export async function getSemanticWorldInfoEntries(recentMessages, activeEntries,
     const topK = settings.world_info_top_k || 3;
 
     // Use pre-fetched collections if provided (avoids double call from handleGenerationStarted)
-    const lorebookCollections = preloadedCollections ?? await getEnabledLorebookCollections(settings);
+    const lorebookCollections = preloadedCollections
+        ?? (await selectActiveLorebookCollections(settings, recentMessages)).active;
 
     for (const collection of lorebookCollections) {
         try {
@@ -107,12 +124,44 @@ export async function getSemanticWorldInfoEntries(recentMessages, activeEntries,
             // In dual-query mode the user's last message runs alongside the full context —
             // a chunk that ranks outside topK for the context query can still be surfaced
             // if it ranks within topK for the focused user-message query.
-            const queryResults = await Promise.all(
-                queryTexts.map(qt => queryCollection(lookupKey, qt, topK, settings).catch(() => null))
+            //
+            // A failed query still must not break the generation, so each one is caught
+            // individually — but the outcome is recorded rather than discarded. The old
+            // `.catch(() => null)` here made a dead backend and a book with no relevant
+            // content produce byte-identical behavior: zero entries, no log, no toast.
+            // That is the reporting gap behind GitHub issue #11.
+            const queryOutcomes = await Promise.all(
+                queryTexts.map(qt => queryCollection(lookupKey, qt, topK, settings)
+                    .then(result => ({ ok: true, result }))
+                    .catch(error => ({ ok: false, error }))),
             );
 
+            const failures = queryOutcomes.filter(o => !o.ok);
+            if (failures.length === queryOutcomes.length) {
+                // Every query for this book failed — it contributes nothing this turn.
+                // Loud, because the user is about to send a message believing this
+                // lorebook is active.
+                const error = failures[0].error;
+                log.error(
+                    `VectFox WI: retrieval FAILED for lorebook "${collection.name}" (${lookupKey}) — `
+                    + `no entries from this book will be injected this turn:`,
+                    error?.message || error,
+                );
+                notifyRetrievalFailure('Lorebook', collection.name, error);
+                continue;
+            }
+            if (failures.length) {
+                // Partial: one query text of the dual-query pair failed. Recall is
+                // reduced but the book still contributes, so warn rather than toast.
+                log.warn(
+                    `VectFox WI: ${failures.length}/${queryOutcomes.length} queries failed for lorebook `
+                    + `"${collection.name}" — reduced recall this turn:`,
+                    failures[0].error?.message || failures[0].error,
+                );
+            }
+
             const bestByUid = new Map();
-            for (const result of queryResults) {
+            for (const { result } of queryOutcomes.filter(o => o.ok)) {
                 if (!result?.metadata) continue;
                 for (const meta of result.metadata) {
                     const uid = meta.uid || meta.hash;
@@ -176,24 +225,97 @@ export async function getSemanticWorldInfoEntries(recentMessages, activeEntries,
 }
 
 /**
- * Get all enabled lorebook collections for semantic WI search.
- * No keyword-trigger or lock gate — vector similarity is the activation mechanism.
- * shouldCollectionActivate() returns false for collections with no triggers/conditions/locks,
- * which is the default state for a semantic-WI lorebook. Gating on it silently blocks all results.
- * @param {object} settings - VectFox settings
- * @returns {Promise<Array<{id: string, name: string, sourceName: string|null}>>}
+ * Classify WHY a lorebook collection failed shouldCollectionActivate, so the
+ * summary can say something more useful than "0 available".
+ *
+ * Read-only re-derivation from the same metadata the activation chain reads —
+ * shouldCollectionActivate returns a bare boolean and this deliberately does not
+ * change that contract. Kept in sync with core/collection-metadata.js's GATE
+ * order: lock (master switch) → triggers → conditions.
+ *
+ * @param {string} registryKey
+ * @param {{currentChatId: string|null, currentCharacterId: string|null}} context
+ * @returns {'not_locked'|'locked_elsewhere'|'trigger_unmatched'|'conditions_failed'}
  */
-async function getEnabledLorebookCollections(settings) {
+function _classifyInactiveLorebook(registryKey, context) {
+    const meta = getCollectionMeta(registryKey) || {};
+    const anyLocks = getCollectionLockCount(registryKey) + getCollectionCharacterLockCount(registryKey);
+
+    // Gate 2 is where most inactive books die: the master switch is simply off.
+    // Distinguish "never switched on anywhere" from "switched on, but somewhere
+    // else" — the fixes are different (tick the box here vs. a stale lock).
+    const lockedHere = (!!context.currentChatId && isCollectionLockedToChat(registryKey, context.currentChatId))
+        || (!!context.currentCharacterId && isCollectionLockedToCharacter(registryKey, context.currentCharacterId));
+    if (!lockedHere) {
+        // Locks exist elsewhere. Classic stale-lock symptom — ST character ids are
+        // ARRAY INDICES, so they re-point at a different character whenever the
+        // character list is reordered or resized.
+        return anyLocks > 0 ? 'locked_elsewhere' : 'not_locked';
+    }
+
+    // Locked here, so a configured filter rejected it this turn.
+    if (Array.isArray(meta.triggers) && meta.triggers.length > 0) return 'trigger_unmatched';
+    return 'conditions_failed';
+}
+
+/**
+ * Select the lorebook collections eligible for semantic WI search this turn, and
+ * report what was filtered out and why.
+ *
+ * Returns the tally as well as the survivors because an empty result is the most
+ * dangerous outcome in this whole path: the caller's loop simply never runs, the
+ * retrieval popup is skipped, and the generation proceeds with no lorebook memory
+ * and no indication anything was meant to happen. The per-collection reason is a
+ * log.trace inside shouldCollectionActivate that nobody has switched on.
+ *
+ * @param {object} settings - VectFox settings
+ * @returns {Promise<{active: Array<{id: string, name: string, sourceName: string|null}>,
+ *                    candidateCount: number,
+ *                    skipped: {disabled: number, foreignPersona: number,
+ *                              trigger_set_but_unmatched: number, locked_elsewhere: number,
+ *                              never_configured: number},
+ *                    inactiveNames: string[]}>}
+ */
+async function selectActiveLorebookCollections(settings, recentMessages = []) {
     const listing = getCollectionListing(settings);
     const collections = [];
+    const skipped = {
+        disabled: 0,
+        foreignPersona: 0,
+        not_locked: 0,
+        locked_elsewhere: 0,
+        trigger_unmatched: 0,
+        conditions_failed: 0,
+    };
+    const inactiveNames = [];
+    let candidateCount = 0;
 
     const currentChatId = getCurrentChatId() ? String(getCurrentChatId()) : null;
     const currentCharacterId = getContext().characterId != null ? String(getContext().characterId) : null;
-    const context = { currentChatId, currentCharacterId };
+    // recentMessages is REQUIRED for trigger matching: checkTriggers() reads
+    // context.recentMessages and returns false immediately when the joined text is
+    // empty (core/collection-metadata.js:1003-1010). Omitting it — as this function
+    // did — made Priority 2 (Activation Triggers) unreachable for every lorebook
+    // collection, so a trigger-keyword lorebook with no chat/character lock could
+    // never activate no matter what the user typed. Only the lock priorities worked,
+    // because currentChatId/currentCharacterId were the only fields supplied.
+    // The document/ChunkBase path never hit this: it passes a full
+    // buildSearchContext() (core/conditional-activation.js:637).
+    //
+    // Newest-first ordering matches checkTriggers' `slice(0, scanDepth)`. Depth is
+    // bounded by world_info_query_depth, so a collection's triggerScanDepth is
+    // effectively capped by it.
+    const context = { currentChatId, currentCharacterId, recentMessages };
 
     for (const entry of listing) {
         if (!entry.collectionId.startsWith('vf_lorebook_')) continue;
-        if (entry.meta.enabled === false) continue;
+        candidateCount++;
+        const displayName = entry.meta?.sourceName || entry.collectionId;
+        if (entry.meta.enabled === false) {
+            // Deliberate user pause — counted for the summary, never toasted.
+            skipped.disabled++;
+            continue;
+        }
         // Respect persona ownership before checking activation. The activation
         // chain (Doc/collection_helper.md) lets trigger keywords activate a
         // collection regardless of who owns it — which leaks another persona's
@@ -204,16 +326,128 @@ async function getEnabledLorebookCollections(settings) {
         // stop seeing cross-persona content. Surfaced by prod symptom on
         // 2026-05-23 (rabbit's Your Wives lorebook leaking into critblade's
         // ArtificRealm chat) — TEST 011 covers this gate.
-        if (!entry.isOwn) continue;
-        if (!(await shouldCollectionActivate(entry.registryKey, context))) continue;
+        if (!entry.isOwn) {
+            skipped.foreignPersona++;
+            continue;
+        }
+        if (!(await shouldCollectionActivate(entry.registryKey, context))) {
+            skipped[_classifyInactiveLorebook(entry.registryKey, context)]++;
+            inactiveNames.push(displayName);
+            continue;
+        }
 
         const sourceName = entry.meta?.sourceName || null;
         const name = sourceName || entry.collectionId;
         collections.push({ id: entry.registryKey, name, sourceName });
     }
 
-    log.verbose(`VectFox WI: ${collections.length} lorebook collection(s) available for semantic search`);
-    return collections;
+    // Verbosity 2 gets the full accounting, not just a count — "0 available" on
+    // its own tells the user nothing about which knob to turn.
+    log.verbose(
+        `VectFox WI: ${collections.length}/${candidateCount} lorebook collection(s) eligible for semantic search`
+        + (candidateCount ? ` — skipped: ${_describeSkipped(skipped) || 'none'}` : ''),
+    );
+
+    return { active: collections, candidateCount, skipped, inactiveNames };
+}
+
+/** Human-readable skip tally, empty string when nothing was skipped. */
+function _describeSkipped(skipped) {
+    const labels = {
+        disabled: 'paused by user',
+        foreignPersona: 'owned by another persona',
+        not_locked: 'not locked to any chat or character — tick "Active for current chat" to switch it on',
+        locked_elsewhere: 'locked to a different chat/character',
+        trigger_unmatched: 'locked, but its trigger keywords did not match this turn',
+        conditions_failed: 'locked, but its advanced conditions did not pass this turn',
+    };
+    return Object.entries(skipped)
+        .filter(([, count]) => count > 0)
+        .map(([reason, count]) => `${count} ${labels[reason]}`)
+        .join('; ');
+}
+
+/**
+ * Resolves semantic hits against the LIVE lorebook before injection.
+ *
+ * The vector store snapshots entry text at vectorization time; injecting that
+ * snapshot serves stale content once the lorebook changes (append-only
+ * chronicles that grow every few turns). This pass:
+ *   1. replaces each hit's content with the entry's current lorebook content,
+ *   2. drops hits whose entry no longer exists (deleted),
+ *   3. drops hits whose entry is disabled (setting-gated, default on).
+ *
+ * Entries without sourceName/entryUid metadata (pre-per_entry vectorizations)
+ * and books that fail to load fall back to the vector-stored text, so this is
+ * strictly additive — it can correct or drop, never error out a generation.
+ *
+ * One loadWorldInfo per distinct book per call (the per-generation cache):
+ * semantic hits cluster in 1–3 books, so latency stays negligible.
+ *
+ * @param {object[]} semanticEntries - Hits from getSemanticWorldInfoEntries
+ * @param {object} settings - VectFox settings
+ * @returns {Promise<object[]>}
+ */
+export async function resolveLiveEntries(semanticEntries, settings) {
+    if (!semanticEntries?.length) return semanticEntries || [];
+    const respectDisable = settings?.world_info_respect_entry_disable !== false;
+
+    let loadWorldInfo = null;
+    try {
+        ({ loadWorldInfo } = await import('../../../../world-info.js'));
+    } catch (_) { /* host module unavailable (tests/headless) — fall through */ }
+    if (typeof loadWorldInfo !== 'function') return semanticEntries;
+
+    /** @type {Map<string, object|null>} sourceName → live entries object (null = load failed) */
+    const bookCache = new Map();
+    const resolved = [];
+
+    for (const e of semanticEntries) {
+        const sourceName = e.metadata?.sourceName;
+        const entryUid = e.metadata?.entryUid;
+        if (!sourceName || entryUid === null || entryUid === undefined) {
+            resolved.push(e); // no identity metadata — keep vector text
+            continue;
+        }
+
+        if (!bookCache.has(sourceName)) {
+            try {
+                const book = await loadWorldInfo(sourceName);
+                // ST's loadWorldInfo returns a dummy { entries: {} } for a book that
+                // isn't on disk (readWorldInfoFile allowDummy=true) — NOT null. An empty
+                // entries object therefore means "book absent", indistinguishable from a
+                // load failure, so normalize it to null: otherwise every hit falls through
+                // to `liveEntries[entryUid] === undefined` and gets dropped as "deleted",
+                // silently zeroing semantic WI for any book whose name isn't a live .json
+                // (character-embedded, imported/renamed/deleted, or name != filename).
+                const entries = book?.entries;
+                bookCache.set(sourceName, entries && Object.keys(entries).length ? entries : null);
+            } catch (_) {
+                bookCache.set(sourceName, null);
+            }
+        }
+        const liveEntries = bookCache.get(sourceName);
+        if (!liveEntries) {
+            resolved.push(e); // book failed to load / absent — keep vector text (offline-safe)
+            continue;
+        }
+
+        const live = liveEntries[entryUid];
+        if (!live) {
+            log.trace(`VectFox WI: dropping semantic hit for deleted entry ${sourceName}::${entryUid}`);
+            continue;
+        }
+
+        if (respectDisable && live.disable === true) {
+            log.trace(`VectFox WI: dropping semantic hit for disabled entry ${sourceName}::${entryUid}`);
+            continue;
+        }
+
+        const liveContent = typeof live.content === 'string' ? live.content : '';
+        resolved.push(liveContent.trim() ? { ...e, content: liveContent } : e);
+    }
+
+    return resolved;
 }
 
 /**
@@ -387,6 +621,10 @@ async function handleGenerationStarted(type, options, dryRun) {
     // Always clear the previous lorebook injection first
     setExtensionPrompt(LOREBOOK_PROMPT_TAG, '', settings.position, settings.depth, false);
 
+    // Master switch: skip lorebook WI injection when VectFox is disabled (the
+    // stale injection was just cleared above).
+    if (!isVectFoxEnabled(settings)) return;
+
     try {
         const context = getContext();
         const chat = context.chat || [];
@@ -404,7 +642,39 @@ async function handleGenerationStarted(type, options, dryRun) {
         const keywordQuery = lastUserMessage?.mes?.trim() || null;
 
         // Fetch collections once — used for rename detection and passed to the query.
-        const lorebookCollections = await getEnabledLorebookCollections(settings);
+        const {
+            active: lorebookCollections,
+            candidateCount,
+            skipped,
+            inactiveNames,
+        } = await selectActiveLorebookCollections(settings, recentMessages);
+
+        // Semantic WI is ON and vectorized lorebooks exist, yet none qualified this
+        // turn. Nothing downstream runs: the query loop never iterates, the retrieval
+        // popup is skipped, and the message sends with no lorebook memory and no sign
+        // it was ever meant to have any. Announce it — the per-collection reason is a
+        // log.trace nobody has switched on, and the fix (lock it to this chat or
+        // character) is not discoverable from the symptom.
+        //
+        // Collections the user deliberately paused are excluded from the trigger:
+        // "I turned it off and it's off" is not a surprise worth a toast.
+        if (candidateCount > 0 && lorebookCollections.length === 0) {
+            const actionable = candidateCount - skipped.disabled;
+            if (actionable > 0) {
+                const reason = _describeSkipped(skipped);
+                const named = inactiveNames.slice(0, 3).map(n => `"${n}"`).join(', ');
+                log.warn(
+                    `VectFox WI: Semantic WI is enabled and ${candidateCount} vectorized lorebook(s) exist, `
+                    + `but NONE are active this turn — ${reason || 'no reason recorded'}`,
+                );
+                notifyNoActiveCollections(
+                    'Semantic Lorebook',
+                    getCurrentChatId() || '',
+                    `${actionable} vectorized lorebook(s)${named ? ` (${named})` : ''} were skipped: ${reason}.`,
+                );
+            }
+            return;
+        }
 
         // Rename detection: if a lorebook was renamed after vectorization, its
         // sourceName won't match any entry in world_names. Show a blocking popup.
@@ -425,11 +695,30 @@ async function handleGenerationStarted(type, options, dryRun) {
             // 'continue' — user acknowledged stale content, proceed
         }
 
-        const semanticEntries = await getSemanticWorldInfoEntries(recentMessages, [], settings, keywordQuery, lorebookCollections);
+        // Same contract as the sibling ChunkBase/EventBase pipelines — see
+        // core/bounded-retrieval.js. Timeout or an unexpected throw above the
+        // per-collection catches means the
+        // whole turn loses lorebook memory — runBoundedRetrieval logs and toasts it
+        // and hands back the fallback, so a failure and a genuinely empty corpus
+        // stay distinguishable to the user.
+        const semanticEntries = await runBoundedRetrieval(
+            getSemanticWorldInfoEntries(recentMessages, [], settings, keywordQuery, lorebookCollections),
+            {
+                contextLabel: 'Lorebook',
+                sourceName: 'all vectorized lorebooks',
+                timeoutMessage: 'Lorebook WI retrieval timed out',
+                fallback: [],
+                settings,
+            },
+        );
         if (!semanticEntries.length) return;
 
+        // Swap vector-snapshot text for live lorebook content; drop deleted/disabled entries.
+        const liveEntries = await resolveLiveEntries(semanticEntries, settings);
+        if (!liveEntries.length) return;
+
         // Format entries into direct prompt injection under <VectFoxLorebook>
-        const entryTexts = semanticEntries
+        const entryTexts = liveEntries
             .filter(e => e.content?.trim())
             .map(e => {
                 const title = _resolveEntryTitle(e);
@@ -452,7 +741,7 @@ async function handleGenerationStarted(type, options, dryRun) {
 
 /**
  * Dry-run the Lorebook WI pipeline for the query tester.
- * Reuses getEnabledLorebookCollections + getSemanticWorldInfoEntries — same path as
+ * Reuses selectActiveLorebookCollections + getSemanticWorldInfoEntries — same path as
  * handleGenerationStarted, but skips rename detection and setExtensionPrompt.
  *
  * @param {{ chat: object[], testMessage: string|null, settings: object }} opts
@@ -469,13 +758,28 @@ export async function runLorebookWIDryRun({ chat, testMessage, settings }) {
 
     if (!recentMessages.length) return { injectionText: null, entryCount: 0 };
 
-    const lorebookCollections = await getEnabledLorebookCollections(settings);
+    const { active: lorebookCollections } = await selectActiveLorebookCollections(settings, recentMessages);
     if (!lorebookCollections.length) return { injectionText: null, entryCount: 0, noCollections: true };
 
-    const semanticEntries = await getSemanticWorldInfoEntries(recentMessages, [], settings, testMessage || null, lorebookCollections);
+    // Same surfacing as the generation path — the tester exists to answer "why did
+    // I get nothing?", so a silent timeout here would defeat its whole purpose.
+    const semanticEntries = await runBoundedRetrieval(
+        getSemanticWorldInfoEntries(recentMessages, [], settings, testMessage || null, lorebookCollections),
+        {
+            contextLabel: 'Lorebook',
+            sourceName: 'query tester dry-run',
+            timeoutMessage: 'Lorebook WI retrieval timed out',
+            fallback: [],
+            settings,
+        },
+    );
     if (!semanticEntries.length) return { injectionText: null, entryCount: 0 };
 
-    const entryTexts = semanticEntries.filter(e => e.content?.trim()).map(e => {
+    // Same live-resolution as the real injection path, so the tester shows real behavior.
+    const liveEntries = await resolveLiveEntries(semanticEntries, settings);
+    if (!liveEntries.length) return { injectionText: null, entryCount: 0 };
+
+    const entryTexts = liveEntries.filter(e => e.content?.trim()).map(e => {
         const title = _resolveEntryTitle(e);
         const content = e.content.trim();
         return title ? `# ${title}\n${content}` : content;

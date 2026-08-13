@@ -18,13 +18,20 @@
 
 import { getOpenRouterApiKey, getCustomApiKey } from './api-keys.js';
 import { getDefaultSummarizePrompt } from './prompts-i18n.js';
-import { getModelConfigErrorMessage } from './model-http-errors.js';
-import { getRequestHeaders } from '../../../../../script.js';
+import { postChatCompletion, resolveModelParameterStyle, LlmCallError } from './llm-provider-call.js';
 import { log } from './log.js';
 
 /**
  * Fatal summarization error that should abort vectorization instead of silently
  * falling back to raw text.
+ *
+ * SLATED FOR REMOVAL: this type (and `isSummarizationFatalError` + `summarizeText`)
+ * is a summarizer-only error path. Its only consumer — the summarize-before-store
+ * pipeline in content-vectorization.js — is currently DISABLED. When that pipeline is
+ * revived it must route errors through the shared core/model-config-notifier.js helpers
+ * (isInvalidModelConfigError/notifyInvalidModel + isConnectionError/notifyConnectionError)
+ * like every other LLM path, after which delete this class for codebase consistency.
+ * See the REVIVAL NOTE in content-vectorization.js.
  */
 export class SummarizationFatalError extends Error {
     /**
@@ -57,8 +64,8 @@ export function isSummarizationFatalError(err) {
  * @returns {{ok: true} | {ok: false, reason: string}}
  */
 export function validateLLMConfig(settings = {}) {
-    const provider = (settings?.summarize_provider || 'openrouter').toLowerCase();
-    const model = (settings?.summarize_model || '').trim();
+    const provider = (settings?.chat_provider || 'openrouter').toLowerCase();
+    const model = (settings?.chat_model || '').trim();
 
     if (!model) {
         return { ok: false, reason: 'Summarization / EventBase extraction model is not set.' };
@@ -70,7 +77,7 @@ export function validateLLMConfig(settings = {}) {
             return { ok: false, reason: 'OpenRouter API key is not set.' };
         }
     } else if (provider === 'vllm') {
-        const url = (settings?.summarize_vllm_url || '').trim();
+        const url = (settings?.chat_vllm_url || '').trim();
         if (!url) {
             return { ok: false, reason: 'vLLM Base URL is not set.' };
         }
@@ -88,7 +95,7 @@ export function validateLLMConfig(settings = {}) {
  * @returns {string}
  */
 export function getSummarizationConfigFingerprint(settings = {}) {
-    const provider = settings?.summarize_provider || 'openrouter';
+    const provider = settings?.chat_provider || 'openrouter';
 
     if (provider === 'openrouter') {
         const key = _getOpenRouterApiKey(settings);
@@ -98,7 +105,7 @@ export function getSummarizationConfigFingerprint(settings = {}) {
     }
 
     if (provider === 'vllm') {
-        const url = (settings?.summarize_vllm_url || '').trim();
+        const url = (settings?.chat_vllm_url || '').trim();
         // Key now lives in SECRET_KEYS.CUSTOM (masked client-side). Fingerprint
         // uses the masked-value length + boundary chars — still deterministic for
         // detecting key-rotation, never logs the secret.
@@ -128,6 +135,11 @@ const DEFAULT_TIMEOUT_MS = 30000;
  * document / etc.) no longer routes through the summarizer, so there is no caller
  * that wants the un-summarized text back.
  *
+ * CURRENTLY UNUSED / SLATED FOR REMOVAL — see SummarizationFatalError above and the
+ * REVIVAL NOTE in content-vectorization.js. The only call site (summarize-before-store)
+ * is disabled; on revival, switch its error handling to the shared model-config-notifier
+ * helpers and delete this function.
+ *
  * @param {string} text - Raw message/chunk text to summarize
  * @param {object} settings - VectFox settings object
  * @returns {Promise<string>} Summary text
@@ -137,10 +149,10 @@ const DEFAULT_TIMEOUT_MS = 30000;
 export async function summarizeText(text, settings) {
     if (!text || typeof text !== 'string') return text;
 
-    const provider = settings?.summarize_provider || 'openrouter';
+    const provider = settings?.chat_provider || 'openrouter';
     // don't remove
     //log.verbose(`[VectFox Summarizer] summarizeText called — provider=${provider}, textLen=${text.length}`);
-    const model = (settings?.summarize_model || '').trim();
+    const model = (settings?.chat_model || '').trim();
     if (!model) {
         throw new SummarizationFatalError(
             'No summarization model configured. Set a model in Summarize Before Store settings.',
@@ -182,28 +194,26 @@ function _estimateSummaryTokenBudget(text) {
     return CJK_RATIO > 0.1 ? CJK_MAX_TOKENS : DEFAULT_MAX_TOKENS;
 }
 
-/**
- * Build a standard OpenAI-compatible chat completions request body.
- * @param {string} prompt
- * @param {string} model
- * @returns {object}
- */
-function _buildBody(prompt, model, maxTokens = DEFAULT_MAX_TOKENS) {
-    return {
-        model: model,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: maxTokens,
-        temperature: 0.3,
-    };
-}
+// Summarization runs at temperature 0.3 (was hardcoded in the old _buildBody).
+const SUMMARIZE_TEMPERATURE = 0.3;
 
 /**
- * Extract the assistant reply text from an OpenAI-compatible response.
- * @param {object} data
- * @returns {string|null}
+ * Map a neutral LlmCallError from the shared provider-call module onto the
+ * Summarizer's error taxonomy, preserving prior policy exactly: auth /
+ * model-config / connection are SummarizationFatalError; http / empty stay a
+ * plain Error (transient). Non-LlmCallError values pass through.
+ * @param {unknown} e
+ * @returns {Error}
  */
-function _extractReply(data) {
-    return data?.choices?.[0]?.message?.content?.trim() || null;
+function _mapSummarizerError(e) {
+    if (!(e instanceof LlmCallError)) return /** @type {Error} */ (e);
+    const provider = e.provider === 'vllm' ? 'vllm' : 'openrouter';
+    switch (e.kind) {
+        case 'auth': return new SummarizationFatalError(e.message, provider, 'invalid_api_key');
+        case 'model_config': return new SummarizationFatalError(e.message, provider, 'invalid_model_config');
+        case 'connection': return new SummarizationFatalError(e.message, provider, 'connection_failed');
+        default: return new Error(e.message); // 'http' | 'upstream_error' | 'empty'
+    }
 }
 
 // _getOpenRouterApiKey was inlined here pre-H-1; now an alias for the
@@ -212,14 +222,9 @@ function _extractReply(data) {
 // architecture pivot rationale (custom secret_state slots don't round-trip).
 const _getOpenRouterApiKey = getOpenRouterApiKey;
 
-async function _callOpenRouter(prompt, model, settings, originalLength, maxTokens = DEFAULT_MAX_TOKENS, timeoutMs = DEFAULT_TIMEOUT_MS) {
-    // Presence-only check: getOpenRouterApiKey() returns the MASKED value from
-    // secret_state (e.g. "*******abcd"), not the real key — ST's getSecretState
-    // masks all non-EXPORTABLE_KEYS. We can't send a masked value as a Bearer
-    // token, so we route through ST's own /api/backends/chat-completions/generate
-    // proxy, which reads the real key server-side via readSecret(SECRET_KEYS.OPENROUTER)
-    // and forwards to OpenRouter. Same pattern the embedding flow already uses
-    // via /api/vector/insert.
+async function _callOpenRouter(prompt, model, settings, originalLength, maxTokens = DEFAULT_MAX_TOKENS, timeoutMs = settings?.summarize_timeout_ms || DEFAULT_TIMEOUT_MS) {
+    // Presence-only check: getOpenRouterApiKey() returns ST's MASKED value; the
+    // real key is read server-side by the proxy (see llm-provider-call.js).
     const apiKey = _getOpenRouterApiKey(settings);
     if (!apiKey) {
         throw new SummarizationFatalError(
@@ -229,56 +234,23 @@ async function _callOpenRouter(prompt, model, settings, originalLength, maxToken
         );
     }
 
-    const response = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({
-            chat_completion_source: 'openrouter',
-            ..._buildBody(prompt, model, maxTokens),
-        }),
-        signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    if (!response.ok) {
-        const errText = await response.text().catch(() => response.statusText);
-        if (response.status === 401 || response.status === 403) {
-            throw new SummarizationFatalError(
-                `OpenRouter authentication failed (${response.status}). Check your API key.`,
-                'openrouter',
-                'invalid_api_key'
-            );
-        }
-        const modelConfigError = getModelConfigErrorMessage({
-            contextLabel: 'Summarizer',
-            provider: 'OpenRouter',
+    try {
+        const { content } = await postChatCompletion({
+            messages: [{ role: 'user', content: prompt }],
             model,
-            status: response.status,
-            responseText: errText,
-        });
-        if (modelConfigError) {
-            throw new SummarizationFatalError(modelConfigError, 'openrouter', 'invalid_model_config');
-        }
-        throw new Error(`OpenRouter HTTP ${response.status}: ${errText}`);
-    }
-
-    const data = await response.json();
-    const summary = _extractReply(data);
-    if (!summary) {
-        const bodyText = data?.error ? JSON.stringify(data.error) : JSON.stringify(data || {});
-        const modelConfigError = getModelConfigErrorMessage({
+            provider: 'openrouter',
+            maxTokens,
+            temperature: SUMMARIZE_TEMPERATURE,
+            timeoutMs,
             contextLabel: 'Summarizer',
-            provider: 'OpenRouter',
-            model,
-            status: response.status,
-            responseText: bodyText,
-            enforceStatusGate: false,
+            ...resolveModelParameterStyle(settings),
         });
-        if (modelConfigError) throw new SummarizationFatalError(modelConfigError, 'openrouter', 'invalid_model_config');
-        throw new Error('OpenRouter returned empty summary');
+        // don't remove
+        //log.verbose(`[VectFox Summarizer] OpenRouter: ${originalLength} chars → ${content.length} chars`);
+        return content;
+    } catch (e) {
+        throw _mapSummarizerError(e);
     }
-    // don't remove 
-    //log.verbose(`[VectFox Summarizer] OpenRouter: ${originalLength} chars → ${summary.length} chars`);
-    return summary;
 }
 
 /**
@@ -294,7 +266,7 @@ async function _callOpenRouter(prompt, model, settings, originalLength, maxToken
  * normalization — the vLLM-style base URL flows through three call sites and
  * inline regex drift was the bug that surfaced this helper.
  *
- * @param {string} baseUrl raw user input from settings.summarize_vllm_url etc.
+ * @param {string} baseUrl raw user input from settings.chat_vllm_url etc.
  * @returns {string} fully-qualified chat-completions URL
  */
 export function buildVllmChatCompletionsUrl(baseUrl) {
@@ -305,13 +277,8 @@ export function buildVllmChatCompletionsUrl(baseUrl) {
         + '/v1/chat/completions';
 }
 
-async function _callVLLM(prompt, model, settings, maxTokens = DEFAULT_MAX_TOKENS, timeoutMs = DEFAULT_TIMEOUT_MS) {
-    // Routes through ST's chat-completions proxy with `chat_completion_source:
-    // 'custom'` — ST's server reads the real key from SECRET_KEYS.CUSTOM and
-    // forwards to settings.summarize_vllm_url. Same pattern as _callOpenRouter
-    // above. The function name is kept for compat with the provider-dispatch
-    // switch; the wire is no longer a direct fetch to vLLM.
-    const baseUrl = (settings?.summarize_vllm_url || '').trim();
+async function _callVLLM(prompt, model, settings, maxTokens = DEFAULT_MAX_TOKENS, timeoutMs = settings?.summarize_timeout_ms || DEFAULT_TIMEOUT_MS) {
+    const baseUrl = (settings?.chat_vllm_url || '').trim();
     if (!baseUrl) {
         throw new SummarizationFatalError(
             'vLLM URL not configured.',
@@ -320,8 +287,7 @@ async function _callVLLM(prompt, model, settings, maxTokens = DEFAULT_MAX_TOKENS
         );
     }
 
-    // Presence-only check on the masked key (same caveat as _callOpenRouter:
-    // _readSecretValue returns the masked form). Real key lives server-side.
+    // Presence-only check on the masked key; real key lives server-side.
     const apiKey = getCustomApiKey(settings);
     if (!apiKey) {
         throw new SummarizationFatalError(
@@ -331,56 +297,20 @@ async function _callVLLM(prompt, model, settings, maxTokens = DEFAULT_MAX_TOKENS
         );
     }
 
-    const body = {
-        ..._buildBody(prompt, model, maxTokens),
-        chat_completion_source: 'custom',
-        custom_url: baseUrl,
-    };
-
-    const response = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    if (!response.ok) {
-        const errText = await response.text().catch(() => response.statusText);
-        if (response.status === 401 || response.status === 403) {
-            throw new SummarizationFatalError(
-                `vLLM authentication failed (${response.status}). Check your API key in Summarize Before Store settings.`,
-                'vllm',
-                'invalid_api_key'
-            );
-        }
-        const modelConfigError = getModelConfigErrorMessage({
-            contextLabel: 'Summarizer',
-            provider: 'vLLM',
+    try {
+        const { content } = await postChatCompletion({
+            messages: [{ role: 'user', content: prompt }],
             model,
-            status: response.status,
-            responseText: errText,
-        });
-        if (modelConfigError) {
-            throw new SummarizationFatalError(modelConfigError, 'vllm', 'invalid_model_config');
-        }
-        throw new Error(`vLLM HTTP ${response.status}: ${errText}`);
-    }
-
-    const data = await response.json();
-    const summary = _extractReply(data);
-    if (!summary) {
-        const bodyText = data?.error ? JSON.stringify(data.error) : JSON.stringify(data || {});
-        const modelConfigError = getModelConfigErrorMessage({
+            provider: 'vllm',
+            vllmUrl: baseUrl,
+            maxTokens,
+            temperature: SUMMARIZE_TEMPERATURE,
+            timeoutMs,
             contextLabel: 'Summarizer',
-            provider: 'vLLM',
-            model,
-            status: response.status,
-            responseText: bodyText,
-            enforceStatusGate: false,
+            ...resolveModelParameterStyle(settings),
         });
-        if (modelConfigError) throw new SummarizationFatalError(modelConfigError, 'vllm', 'invalid_model_config');
-        throw new Error('vLLM returned empty summary');
+        return content;
+    } catch (e) {
+        throw _mapSummarizerError(e);
     }
-
-    return summary;
 }

@@ -26,16 +26,27 @@ import { debounce_timeout } from '../../../constants.js';
 import { synchronizeChat, rearrangeChat } from './core/chat-vectorization.js';
 import { purgeAllVectorIndexes, purgeVectorIndex } from './core/core-vector-api.js';
 import { migrateOldEnabledKeys } from './core/collection-metadata.js';
-import { clearCollectionRegistry, discoverExistingCollections, cleanupCorruptedCollections, pruneOrphanedEventBaseChatMaps } from './core/collection-loader.js';
+import { clearCollectionRegistry, cleanupCorruptedCollections } from './core/collection-loader.js';
 import { migrateLegacyApiKeys } from './core/api-keys.js';
-import AsyncUtils from './utils/async-utils.js';
+import { migration_setting_name_for_connection } from './Migration/mg_setting_name_for_connection.js';
+import { migration_embedding_source_key } from './Migration/mg_embedding_source_key.js';
+import { migration_world_info_threshold_rrf_workaround, WORLD_INFO_THRESHOLD_DEFAULT } from './Migration/mg_world_info_threshold_rrf_workaround.js';
 import { log } from './core/log.js';
+import {
+    RETRIEVAL_TIMEOUT_DEFAULT_MS,
+    AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS,
+    AGENTIC_QUERY_TIMEOUT_DEFAULT_MS,
+    AGENTIC_MAX_TOKENS_DEFAULT,
+} from './core/constants.js';
+import { isVectFoxEnabled } from './core/feature-gate.js';
+import { runNetworkStartup } from './core/network-startup.js';
 
 // VectFox modules - UI
 import { renderSettings, openDiagnosticsModal, loadWebLlmModels, updateWebLlmStatus, refreshAutoSyncCheckbox } from './ui/ui-manager.js';
 import { initializeVisualizer } from './ui/chunk-visualizer.js';
 import { initializeDatabaseBrowser } from './ui/database-browser.js';
 import { initializeWorldInfoIntegration } from './core/world-info-integration.js';
+import { refreshWorldInfoEntryDepthCache } from './core/summarizer-injection.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from './core/bm25-scorer.js';
 
 // SillyTavern display label — NOT the settings key. For settings, use 'vectfox' (lowercase).
@@ -43,10 +54,15 @@ const MODULE_NAME = 'VectFox';
 
 // Default settings
 const defaultSettings = {
+    // Master switch — when false, VectFox does no automatic runtime work
+    // (retrieval injection, auto-sync, lorebook WI injection). Default ON.
+    // Single source of truth for reads: core/feature-gate.js::isVectFoxEnabled.
+    enabled: true,
+
     // Core vector settings
-    source: 'transformers',
+    embedding_provider: 'transformers', // embedding provider selection (was `source` pre-Phase-B)
     vector_backend: 'qdrant', // Backend: 'standard' (ST Vectra) | 'qdrant'
-    qdrant_host: 'localhost',
+    qdrant_host: '127.0.0.1',
     qdrant_port: 6333,
     qdrant_url: '',
     // Qdrant API key: stored in ST's secret_state custom slot 'api_key_qdrant'
@@ -59,14 +75,14 @@ const defaultSettings = {
     // core/api-keys.js::fetchQdrantApiKeyPresence (canonical presence check).
     qdrant_use_cloud: false,
     qdrant_multitenancy: false, // Use single collection with content_type field instead of separate collections
-    ollama_alt_endpoint_url: '',
-    ollama_use_alt_endpoint: false,
+    embedding_ollama_url: '',
+    embedding_ollama_url_override: false,
     // ollama_api_key removed 2026-05-26: ST has no SECRET_KEYS.OLLAMA and no
     // ollama auth path in additional-headers.js — the field was dead code on
     // both sides. Migration in core/api-keys.js drains-and-deletes any
     // leftover plaintext from settings.json on first load post-upgrade.
-    vllm_alt_endpoint_url: '',
-    vllm_use_alt_endpoint: false,
+    embedding_vllm_url: '',
+    embedding_vllm_url_override: false,
     rate_limit_calls: 60,
     rate_limit_interval: 60, // seconds
     // Summarizer (EventBase extraction) + Agent Mode planner share ONE
@@ -77,10 +93,11 @@ const defaultSettings = {
 
     // VEC-6: Batch insert optimization
     insert_batch_size: 50, // Chunks per insert batch (50-100 recommended)
+    document_glossary_injection: true, // Document content type only: prepend "Full Name (ACRONYM)" definitions to chunks that reference a bare acronym without it. See core/glossary-extractor.js.
     togetherai_model: 'togethercomputer/m2-bert-80M-32k-retrieval',
     openai_model: 'text-embedding-ada-002',
     electronhub_model: 'text-embedding-3-small',
-    openrouter_model: 'openai/text-embedding-3-large',
+    embedding_openrouter_model: 'openai/text-embedding-3-large',
     // OpenRouter key: stored in SECRET_KEYS.OPENROUTER (ST's shared slot, not in
     // defaults). Reader: core/api-keys.js::getOpenRouterApiKey. The legacy
     // plaintext slot used to live here as `openrouter_api_key: ''` but kept
@@ -88,9 +105,9 @@ const defaultSettings = {
     // Object.assign(extension_settings.vectfox, settings) which would re-add
     // any default-declared empty field after migrateLegacyApiKeys() deleted it.
     cohere_model: 'embed-english-v3.0',
-    ollama_model: 'mxbai-embed-large',
+    embedding_ollama_model: 'mxbai-embed-large',
     ollama_keep: false,
-    vllm_model: '',
+    embedding_vllm_model: '',
     // vLLM key: stored in ST's SECRET_KEYS.CUSTOM (chat-side, via
     // chat_completion_source: 'custom' proxy) AND SECRET_KEYS.VLLM
     // (embedding-side, via ST's vector handler). Dual-write from VectFox UI
@@ -114,6 +131,11 @@ const defaultSettings = {
     top_k: 10,
     retrieval_popup_on_start: true,    // Show popup when retrieval starts
     retrieval_popup_on_result: true,   // Show popup with number of retrieved results
+    // How long one turn may spend on any single retrieval (EventBase, chunk,
+    // lorebook, summarizer injection) before it proceeds without that memory.
+    // Agent Mode ADDS its own planner + fanout timeouts on top of this for the
+    // EventBase path — see core/retrieval-budget.js. UI: Core tab → Retrieval.
+    retrieval_timeout_ms: RETRIEVAL_TIMEOUT_DEFAULT_MS,
     query: 2,
     chunk_size: 500, // For adaptive strategy only
     score_threshold: 0.25,
@@ -151,7 +173,7 @@ const defaultSettings = {
     keyword_extraction_level: 'balanced', // 'off', 'minimal', 'balanced', 'aggressive'
 
     // Summarization before vectorization
-    summarize_provider: 'openrouter', // 'openrouter', 'vllm'
+    chat_provider: 'openrouter', // 'openrouter', 'vllm'
     // summarize_openrouter_api_key and summarize_vllm_api_key are NOT in
     // defaults — they're legacy plaintext fields drained by
     // migrateLegacyApiKeys() into SECRET_KEYS.OPENROUTER and
@@ -159,9 +181,20 @@ const defaultSettings = {
     // respectively. Keeping them here would cause the same Object.assign
     // re-introduction loop documented above on the embedding-side keys.
     // Readers: core/api-keys.js helpers.
-    summarize_model: '',              // Model ID for summarization (e.g. 'google/gemini-flash-1.5-8b')
-    summarize_vllm_url: '',           // vLLM base URL for summarization (e.g. 'http://localhost:8000')
+    chat_model: '',              // Model ID for summarization (e.g. 'google/gemini-flash-1.5-8b')
+    chat_vllm_url: '',           // vLLM base URL for summarization (e.g. 'http://127.0.0.1:8000')
     summarize_prompt: '',             // Custom prompt template (empty = use built-in default)
+    summarize_timeout_ms: 30000,      // Per-call timeout for one "Summarize Before Store" request (ms). Separate from eventbase_timeout_ms (extraction); both share the same model. UI: EventBase tab.
+
+    // Chat-completion request shape — applies to EVERY LLM feature (summarizer,
+    // EventBase extraction, Auto-Reformat, Agent Mode), because one install talks
+    // to one chat endpoint family. Reasoning models (gpt-5.x, o1/o3/o4 and hosted
+    // builds on them) reject `temperature` and `max_tokens` outright; these two
+    // switches reshape the body for them. Reader: resolveModelParameterStyle()
+    // in core/llm-provider-call.js. Defaults keep the classic OpenAI shape.
+    should_send_temperature: true,            // false = omit `temperature` from the request entirely
+    should_use_max_completion_tokens: false,  // true = send `max_completion_tokens` instead of `max_tokens`
+    should_disable_thinking: true,            // false = let the model think; true sends `reasoning_effort: 'none'`
 
     // Hybrid Search fusion settings.
     // A1 (BM25 re-rank, Vectra) reads hybrid_fusion_method/weights when invoked via A2 client-side hybrid.
@@ -189,6 +222,7 @@ const defaultSettings = {
     world_info_top_k: 3,                // Max entries to activate per lorebook
     world_info_query_depth: 3,          // Recent messages to use for query
     world_info_retrieval_popup: false,  // Show popup toast when WI lorebook entries are retrieved
+    world_info_respect_entry_disable: true, // Semantic WI: drop hits whose live lorebook entry is disabled (see resolveLiveEntries)
 
     // Keyword Extraction
     custom_stopwords: '',               // Custom stopwords (comma-separated)
@@ -215,6 +249,15 @@ const defaultSettings = {
     // runs only. Useful when you want the vector index to lag slightly behind
     // the live chat tail. Default 0 = no lag.
     eventbase_autosync_tail_lag_messages: 0,
+    // Settle/commit lag: when true, auto-sync does NOT extract the active (still-
+    // swipeable) last turn — it waits until a newer message supersedes it. Kills
+    // duplicate embeddings from re-rolls/swipes (only the kept, superseded turn is
+    // ever extracted) and cuts wasted extraction calls. ON by default and harmless:
+    // the held-back turn is always the newest message, so it is always inside ST's
+    // live context window already — retrieval never needs it. Manual Vectorize
+    // Content ignores this and still covers the whole chat. See
+    // plans/autosync-settle-lag.md.
+    eventbase_autosync_settle_lag: true,
     // Summarizer Injection (Feature B): when enabled, inject the most recent N
     // EventBase events (by source_window_end desc) into the prompt every turn,
     // wrapped in <VectFoxSummarizer> tags — word-for-word-ish recent-turn memory,
@@ -232,6 +275,18 @@ const defaultSettings = {
     // OLDEST overflow is dropped (most-recent always kept); the latest event is always
     // included even if it alone exceeds the cap. 0 = no cap. Default ~4-6.5k tokens.
     summarizer_injection_max_chars: 10000,
+    // Ghosting (ephemeral prompt wipe): when enabled AND Summarizer Injection is on,
+    // keep the most recent N messages verbatim and blank ALL older already-vectorized
+    // messages from the OUTGOING prompt only. The chat file + UI are untouched and the
+    // effect resets every generation (nothing to undo, branch-safe — mirrors the proven
+    // interceptor-wipe pattern). Trades raw old context for token savings, leaning on
+    // EventBase memory (summarizer injection + semantic retrieval) for the wiped span.
+    // "Keep last N" auto-scales to any chat length (wipe count = tip − N), so a 50-reply
+    // and a 5000-reply chat use the same setting. Gated to Summarizer Injection because
+    // that forces auto-sync window=1, guaranteeing every message below the vectorization
+    // tip is extracted before it could be wiped.
+    eventbase_ghost_enabled: false,
+    eventbase_ghost_keep_recent: 10,              // recent messages kept verbatim; everything older that's vectorized is wiped. range 0-100 (summarizer injects ~20 events to cover the wiped span)
     // Per-chat marker: auto-sync only processes windows whose start >= marker.
     // Stamped at "max(source_window_end across existing events) + 1" when auto-sync
     // is enabled on a non-empty collection, or at current chat length when collection
@@ -326,20 +381,48 @@ const defaultSettings = {
     // parallel against Qdrant. Purely additive — never replaces the existing
     // flow. A3 (Qdrant) only. See plans/agentic-retrieval-plan.md.
     agentic_retrieval_enabled: false,                  // Master toggle (default OFF)
-    agentic_retrieval_provider: '',                    // '' → inherit summarize_provider
-    agentic_retrieval_model: '',                       // '' → inherit summarize_model
+    agent_provider: '',                    // '' → inherit chat_provider
+    agent_model: '',                       // '' → inherit chat_model
     // agentic_retrieval_openrouter_api_key and agentic_retrieval_vllm_api_key
     // are NOT in defaults — same Object.assign re-introduction reason as the
     // other legacy *_api_key slots above. Migration drains them into
     // SECRET_KEYS.OPENROUTER and SECRET_KEYS.CUSTOM + SECRET_KEYS.VLLM
     // (dual-write for vLLM, see embedding/chat split in api-keys.js header).
-    agentic_retrieval_vllm_url: '',                    // '' → inherit summarize_vllm_url
+    agent_vllm_url: '',                    // '' → inherit chat_vllm_url
     agentic_retrieval_chat_depth: 3,                   // # of past chat turns sent to planner (slider 1-10)
     agentic_retrieval_candidates_to_show: 12,          // Pre-search slice shown to planner (slider 5-20)
     agentic_retrieval_max_queries: 6,                  // Hard ceiling on planner output (slider 1-6)
-    agentic_retrieval_timeout_ms: 30000,               // Planner LLM call timeout (matches summarize default; some models need >5s)
-    agentic_retrieval_query_timeout_ms: 10000,         // Per-query fanout timeout — drop a straggling Qdrant call so one slow embed/search doesn't stall retrieval
+    // Both timeouts run INSIDE the EventBase retrieval bound and are ADDED to it
+    // (core/retrieval-budget.js), so raising either really does buy the planner
+    // more time instead of being silently capped by the outer budget.
+    agentic_retrieval_timeout_ms: AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS,       // Planner LLM call timeout (matches summarize default; some models need >5s)
+    agentic_retrieval_query_timeout_ms: AGENTIC_QUERY_TIMEOUT_DEFAULT_MS,   // Per-query fanout timeout — drop a straggling Qdrant call so one slow embed/search doesn't stall retrieval
+    // Planner output-token cap. A thinking model spends this on reasoning before
+    // it writes any JSON, so too low = truncated output = agent mode silently
+    // falls back to pre-search. Was a hardcoded 2000. UI: AgentMode tab.
+    agentic_retrieval_max_tokens: AGENTIC_MAX_TOKENS_DEFAULT,
     agentic_filters_enabled: true,                     // Apply planner-emitted *_any / importance_gte filters (Phase 1.5)
+
+    // ─── Auto-Reformat (Document/URL/Wiki) ──────────────────────────────
+    // Optional, per-session LLM pass offered in Vectorize Content for
+    // Document/URL/Wiki sources. Reads the source, classifies content into
+    // named-entity vs. topic/lore records via a self-tagged schema, and
+    // emits the final chunks directly (bypassing the mechanical strategy
+    // picker for that run) once the user reviews and accepts a full
+    // before/after diff. See core/reformat-schema.js / reformat-extractor.js
+    // / reformat-store.js. Independent from EventBase (chat's LLM pipeline)
+    // by design — no shared pipeline code, only generic utilities.
+    reformat_provider: '',              // '' → inherit chat_provider (Core → LLM Summarization)
+    reformat_model: '',                 // '' → inherit chat_model
+    reformat_vllm_url: '',              // '' → inherit chat_vllm_url
+    reformat_batch_chars: 6000,         // Target input chars per LLM call (packer)
+    reformat_max_output_tokens: 8000,
+    reformat_temperature: 0.2,
+    reformat_timeout_ms: 90000,
+    reformat_concurrency: 2,            // Parallel batch chains
+    reformat_max_body_chars: 2000,      // Oversize-entity ceiling — falls back to the adaptive splitter above this
+    reformat_name_fuzzy_threshold: 0.8, // Hallucination guardrail — min similarity to count a name as source-grounded
+    reformat_custom_prompt: '',
 
     // ─── Hidden / Power-User ────────────────────────────────────────────
     // SUPERADMIN MODE — no GUI toggle. Set to true by hand-editing settings.json
@@ -359,7 +442,7 @@ let settings = { ...defaultSettings };
 const moduleWorker = new ModuleWorkerWrapper(() => synchronizeChat(settings, getBatchSize(), _lastChatTriggerEvent));
 
 // Batch size based on provider
-const getBatchSize = () => ['transformers', 'ollama'].includes(settings.source) ? 1 : 5;
+const getBatchSize = () => ['transformers', 'ollama'].includes(settings.embedding_provider) ? 1 : 5;
 
 // Most recent SillyTavern event that triggered the debounced chat-event handler.
 // Read by synchronizeChat to suppress the auto-sync popup on MESSAGE_SENT (so the
@@ -385,7 +468,7 @@ window['vectfox_rearrangeChat'] = vectfox_rearrangeChat;
  * Action: Sync Chat — shortcut to the Vectorize Content screen.
  *
  * Rather than running a parallel `vectorizeAll` here, this just opens the
- * Vectorize Content modal (chat tab), whose "Continue" button is the single,
+ * Vectorize Content modal (chat tab), whose "Resume" button is the single,
  * mobile-tested vectorization path. Keeping Sync Chat as a shortcut to that
  * screen — instead of its own code — removes the risk of the two drifting.
  */
@@ -508,17 +591,19 @@ jQuery(async () => {
         log.lifecycle(`VectFox: Migrated ${migrationResult.migrated} old collection enabled keys`);
     }
 
-    // Migrate legacy EventBase LLM overrides → unified Core summarize settings.
-    // Copy any non-empty legacy value into the corresponding summarize_* field
-    // (only if summarize_* is still empty — never clobber), then DELETE the
+    // Migrate legacy EventBase LLM overrides → unified Core chat settings.
+    // Copy any non-empty legacy value into the corresponding chat_* field
+    // (only if chat_* is still empty — never clobber), then DELETE the
     // legacy field unconditionally. Previous version copied but left the
     // legacy keys behind as stale empty strings in settings.json.
+    // (Targets are the post-rename `chat_*` names — see the connection-key
+    // rename migration just below; this maps eventbase_* straight to chat_*.)
     const _ebs = extension_settings.vectfox;
     const _ebLegacyMap = [
-        ['eventbase_model', 'summarize_model'],
-        ['eventbase_provider', 'summarize_provider'],
+        ['eventbase_model', 'chat_model'],
+        ['eventbase_provider', 'chat_provider'],
         ['eventbase_openrouter_api_key', 'summarize_openrouter_api_key'],
-        ['eventbase_vllm_url', 'summarize_vllm_url'],
+        ['eventbase_vllm_url', 'chat_vllm_url'],
         ['eventbase_vllm_api_key', 'summarize_vllm_api_key'],
     ];
     let _ebMutated = false;
@@ -539,6 +624,53 @@ jQuery(async () => {
         // 2026-05-26 against a user whose summarize_openrouter_api_key /
         // summarize_vllm_api_key persisted on disk across multiple reloads
         // because the debounced save never fired before page close.
+        const { saveSettings } = await import('../../../../script.js');
+        await saveSettings();
+    }
+
+    // Connection-setting naming convention (Phase A) — rename the convention-less
+    // LLM/embedding keys to the `<consumer>_<provider>_<field>` scheme
+    // (embedding_* / chat_* / agent_*). Runs AFTER the eventbase→chat copy above
+    // so any legacy summarize_* / agentic_retrieval_* / *_alt_endpoint_url +
+    // *_model keys still on disk are renamed here. Idempotent, in-memory only,
+    // no I/O. See Migration/mg_setting_name_for_connection.js +
+    // plans/settings-naming-convention-migration.md. (Phase B — `source` →
+    // `embedding_provider` — is a separate migration, intentionally not here.)
+    const _connRename = migration_setting_name_for_connection(extension_settings.vectfox);
+    if (_connRename.migrated > 0) {
+        log.lifecycle(`VectFox: Renamed ${_connRename.migrated} connection setting key(s): ${_connRename.keys.join(', ')}`);
+        // Persist immediately (not debounced) — same reload-safety reason as the
+        // eventbase block above (R5 in the plan's crash-safety checklist).
+        const { saveSettings } = await import('../../../../script.js');
+        await saveSettings();
+    }
+
+    // Phase B: rename the highest-churn embedding key `source` → `embedding_provider`.
+    // Separate migration from Phase A (its blast radius spans nearly every backend/
+    // query/UI path). Idempotent, in-memory only. See Migration/mg_embedding_source_key.js.
+    const _srcRename = migration_embedding_source_key(extension_settings.vectfox);
+    if (_srcRename.migrated > 0) {
+        log.lifecycle('VectFox: Renamed embedding `source` → `embedding_provider`');
+        const { saveSettings } = await import('../../../../script.js');
+        await saveSettings();
+    }
+
+    // One-time reset of world_info_threshold values tuned against raw RRF scores
+    // (the 0.0x workaround for issue #11). Qdrant hybrid now returns cosine, so a
+    // 0.0x gate would flip from "makes Qdrant work" to "inject everything".
+    // Run-once via stamp — see Migration/mg_world_info_threshold_rrf_workaround.js.
+    const _thresholdReset = migration_world_info_threshold_rrf_workaround(extension_settings.vectfox);
+    if (_thresholdReset.migrated) {
+        log.lifecycle(`VectFox: Reset world_info_threshold ${_thresholdReset.from} → ${WORLD_INFO_THRESHOLD_DEFAULT} (value was a workaround for the pre-cosine RRF score scale)`);
+        try {
+            toastr.info(
+                `Your Lorebook similarity threshold (${_thresholdReset.from}) was a workaround for a scoring bug that is now fixed — scores are real 0-1 similarities on every backend. It has been reset to the default ${WORLD_INFO_THRESHOLD_DEFAULT}.`,
+                'VectFox — setting updated',
+                { timeOut: 15000 },
+            );
+        } catch (_) { /* toastr unavailable (headless) — the log line stands alone */ }
+    }
+    if (_thresholdReset.stamped) {
         const { saveSettings } = await import('../../../../script.js');
         await saveSettings();
     }
@@ -620,72 +752,14 @@ jQuery(async () => {
     // Initialize world info integration hooks
     initializeWorldInfoIntegration();
 
-    // VEC-34: Discover existing collections with retry mechanism
-    // Uses exponential backoff to handle temporary backend unavailability
-    (async () => {
-        try {
-            const collections = await AsyncUtils.retry(
-                () => discoverExistingCollections(settings),
-                {
-                    maxAttempts: 3,
-                    delay: 2000,
-                    maxDelay: 10000,
-                    backoffFactor: 2,
-                    onRetry: (attempt, error) => {
-                        log.warn(`VectFox: Collection discovery attempt ${attempt} failed: ${error.message}. Retrying...`);
-                    }
-                }
-            );
-            if (collections.length > 0) {
-                log.lifecycle(`VectFox: Discovered ${collections.length} existing collections`);
-            }
-            // Discovery succeeded → registry reflects reality. Sweep stale per-chat
-            // EventBase settings (marker / last-window-size / tip) for chats whose
-            // collection no longer exists. Skipped automatically on an empty registry.
-            try {
-                await pruneOrphanedEventBaseChatMaps();
-            } catch (pruneErr) {
-                log.warn('VectFox: Orphan-sweep of per-chat EventBase settings failed (non-fatal):', pruneErr?.message || pruneErr);
-            }
-        } catch (err) {
-            log.error('VectFox: Collection discovery failed after retries:', err.message);
-            toastr.warning(
-                'Could not discover existing collections. Open Database Browser to refresh manually.',
-                'VectFox: Collection Discovery Failed',
-                { timeOut: 10000 }
-            );
-        }
-    })();
-
-    // Phase 1.5: backfill EventBase payload indexes on pre-existing Qdrant collections.
-    if (settings.vector_backend === 'qdrant') {
-        import('./core/eventbase-store.js').then(({ ensureEventBaseIndexes }) => {
-            ensureEventBaseIndexes(settings).catch(err => {
-                log.warn('[VectFox] EventBase index backfill failed:', err);
-            });
-        }).catch(() => {});
+    // Off-box startup work (discovery, EventBase index backfill, plugin version check).
+    // Master switch OFF → skip it entirely; the switch re-runs this when turned back ON,
+    // so no page reload is needed. Fire-and-forget, as it was when inlined here.
+    if (isVectFoxEnabled(settings)) {
+        runNetworkStartup(settings);
+    } else {
+        log.lifecycle('VectFox: master switch OFF — skipping backend/network startup');
     }
-
-    // D5: Cross-repo version check — warn loud if similharity is behind.
-    const SIMILHARITY_EXPECTED_VERSION = '3.3.1';
-    (async () => {
-        try {
-            const resp = await fetch('/api/plugins/similharity/version');
-            if (resp.ok) {
-                const { pluginVersion } = await resp.json();
-                if (pluginVersion !== SIMILHARITY_EXPECTED_VERSION) {
-                    log.warn(`[VectFox] VERSION MISMATCH: expected similharity v${SIMILHARITY_EXPECTED_VERSION}, got v${pluginVersion}. Restart SillyTavern to let it auto-update the server plugin.`);
-                    toastr.warning(
-                        `similharity version mismatch (expected ${SIMILHARITY_EXPECTED_VERSION}, got ${pluginVersion}). Please restart SillyTavern so it can auto-update the server plugin.`,
-                        'VectFox',
-                        { timeOut: 10000 }
-                    );
-                }
-            }
-        } catch (_err) {
-            // similharity not installed — separate problem, not our warning to raise
-        }
-    })();
 
     // Register event handlers. Each wrapper stamps _lastChatTriggerEvent so that
     // when the debounce fires, synchronizeChat knows which event coalesced last —
@@ -699,7 +773,7 @@ jQuery(async () => {
 
     // When WebLLM extension is loaded, refresh the model list
     eventSource.on(event_types.EXTENSION_SETTINGS_LOADED, async (manifest) => {
-        if (settings.source === 'webllm' && manifest?.display_name === 'WebLLM') {
+        if (settings.embedding_provider === 'webllm' && manifest?.display_name === 'WebLLM') {
             log.lifecycle('VectFox: WebLLM extension loaded, refreshing models...');
             updateWebLlmStatus();
             await loadWebLlmModels(settings);
@@ -711,6 +785,17 @@ jQuery(async () => {
         log.lifecycle('VectFox: Chat changed, refreshing UI state');
         refreshAutoSyncCheckbox(settings);
     });
+
+    // Keep the ghosting WI-scan floor accurate: refresh the cached deepest per-entry World
+    // Info scanDepth whenever the active books or WI settings change (off the hot path, so
+    // applyGhosting never blanks a message a deep-scanning WI entry still needs to read).
+    // Debounced — WORLDINFO_UPDATED can fire in bursts while editing, and each refresh loads
+    // lore. Initial call is direct so the floor is correct before the first generation.
+    refreshWorldInfoEntryDepthCache();
+    const refreshWiDepthDebounced = debounce(refreshWorldInfoEntryDepthCache, debounce_timeout.relaxed);
+    eventSource.on(event_types.CHAT_CHANGED, refreshWiDepthDebounced);
+    eventSource.on(event_types.WORLDINFO_UPDATED, refreshWiDepthDebounced);
+    eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, refreshWiDepthDebounced);
 
     log.lifecycle('VectFox: ✅ Initialized successfully');
 });

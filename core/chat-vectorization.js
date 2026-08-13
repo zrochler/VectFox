@@ -33,10 +33,12 @@ import { getChunkMetadata, getCollectionMeta } from './collection-metadata.js';
 import { createDebugData, setLastSearchDebug, addTrace, recordChunkFate } from '../ui/search-debug.js';
 import { Queue, LRUCache } from '../utils/data-structures.js';
 import { getRequestHeaders } from '../../../../../script.js';
-import { EXTENSION_PROMPT_TAG, HASH_CACHE_SIZE, RETRIEVAL_TIMEOUT_MS } from './constants.js';
-import AsyncUtils from '../utils/async-utils.js';
+import { EXTENSION_PROMPT_TAG, HASH_CACHE_SIZE } from './constants.js';
+import { runBoundedRetrieval } from './bounded-retrieval.js';
+import { resolveEventBaseRetrievalTimeoutMs } from './retrieval-budget.js';
 import { log } from './log.js';
 import { expandILSMessages } from './ils-expander.js';
+import { isVectFoxEnabled } from './feature-gate.js';
 // Import from collection-ids.js - single source of truth for collection ID operations
 import {
     getChatUUID,
@@ -101,7 +103,7 @@ function getTextWithoutAttachments(message) {
 async function groupMessagesByStrategy(messages, strategy, batchSize = 4, keywordLevel = 'balanced', settings = {}) {
     if (!messages.length) return [];
 
-    log.verbose(`[VectFox] groupMessagesByStrategy: ${messages.length} messages, strategy=${strategy}, summarize_provider=${settings?.summarize_provider || 'openrouter'}`);
+    log.verbose(`[VectFox] groupMessagesByStrategy: ${messages.length} messages, strategy=${strategy}, chat_provider=${settings?.chat_provider || 'openrouter'}`);
 
     const summarize = (text) => summarizeText(text, settings);
 
@@ -277,6 +279,12 @@ function trackChunkActivation(hash, messageCount) {
 export async function synchronizeChat(settings, batchSize = 5, triggerEvent = null) {
     log.lifecycle(`[AutoSync] synchronizeChat: invoked (trigger=${triggerEvent || 'unknown'})`);
 
+    // Master switch: no auto-sync work while VectFox is disabled.
+    if (!isVectFoxEnabled(settings)) {
+        log.lifecycle('[AutoSync] BAIL: VectFox master switch OFF');
+        return { remaining: -1, messagesProcessed: 0, chunksCreated: 0 };
+    }
+
     const chatId = getCurrentChatId();
     if (!chatId) {
         log.lifecycle('[AutoSync] BAIL: no chatId');
@@ -331,6 +339,19 @@ export async function synchronizeChat(settings, batchSize = 5, triggerEvent = nu
             chatUUID: uuid,
             settings,
             isAutoSync: true,
+            // Pin the write target to the collection we already resolved for the
+            // gate above. Without this, runEventBaseIngestion recomputes the ID via
+            // buildEventBaseCollectionId(uuid), whose char segment comes from the
+            // LIVE context.name2. In a group chat name2 is whichever character is
+            // speaking on this trigger, so each speaker's turn would manufacture and
+            // lock a NEW per-character EventBase collection for the same chat —
+            // scattering events across siblings the summarizer (which reads only the
+            // single resolveActiveEventBaseCollection) never sees. The resolved
+            // active collection IS the documented auto-sync write target
+            // (see Doc/collection_helper.md — resolveActiveEventBaseCollection).
+            // activeCollection is guaranteed non-null here: the autoSyncEnabled gate
+            // above bails when it's null.
+            collectionIdOverride: activeCollection.collectionId,
             // Suppress the popup when the trigger was the user sending a message —
             // the popup should only appear after the AI's reply, not mid-generation.
             // MESSAGE_RECEIVED (and edits/swipes/deletes) still get the popup.
@@ -634,10 +655,10 @@ async function expandSummaryChunks(chunks, activeCollections, settings, debugDat
 
                         recordChunkFate(debugData, parentHash, 'summary_expansion', 'passed',
                             `Expanded from summary #${summaryChunk.hash}`, {
-                                summaryHash: summaryChunk.hash,
-                                parentTextLength: expandedChunk.text?.length || 0,
-                                inheritedScore: summaryChunk.score?.toFixed(3)
-                            });
+                            summaryHash: summaryChunk.hash,
+                            parentTextLength: expandedChunk.text?.length || 0,
+                            inheritedScore: summaryChunk.score?.toFixed(3)
+                        });
 
                         addTrace(debugData, 'summary_expansion', `Parent chunk retrieved`, {
                             parentHash: parentHash,
@@ -651,9 +672,9 @@ async function expandSummaryChunks(chunks, activeCollections, settings, debugDat
 
                         recordChunkFate(debugData, summaryChunk.hash, 'summary_expansion', 'passed',
                             `Parent not found, using summary text`, {
-                                parentHash: parentHash,
-                                fallback: true
-                            });
+                            parentHash: parentHash,
+                            fallback: true
+                        });
                     }
                 }
             } else {
@@ -1143,7 +1164,7 @@ function injectChunksIntoPrompt(chunksToInject, settings, debugData) {
 
         if (injectionDebug) {
             log.domain('injection', 'trace', `[VECTFOX Injection Control] Single position injection: position="${group.position}", depth=${group.depth}, chunks=${group.chunks.length}, textLength=${insertedText.length}`);
-            log.domain('injection', 'trace', `[VECTFOX Injection Control] Injection text preview: "${insertedText.substring(0, 200)}${insertedText.length > 200 ? '...' : ''}"`); 
+            log.domain('injection', 'trace', `[VECTFOX Injection Control] Injection text preview: "${insertedText.substring(0, 200)}${insertedText.length > 200 ? '...' : ''}"`);
         }
 
         setExtensionPrompt(EXTENSION_PROMPT_TAG, insertedText, group.position, group.depth, false);
@@ -1280,6 +1301,14 @@ export async function rearrangeChat(chat, settings, type, { dryRun = false, test
             }
         }
 
+        // Master switch: inject nothing into live generation when disabled. Any
+        // stale injection was just cleared above. The dry-run query tester stays
+        // functional so users can still inspect retrieval while VectFox is off.
+        if (!dryRun && !isVectFoxEnabled(settings)) {
+            log.lifecycle('VectFox: master switch OFF — skipping retrieval/injection');
+            return;
+        }
+
         if (!getCurrentChatId() || !Array.isArray(chat)) {
             log.trace('VectFox: No chat selected');
             return dryRun ? { injectionText: null, chunkCount: 0 } : undefined;
@@ -1297,25 +1326,29 @@ export async function rearrangeChat(chat, settings, type, { dryRun = false, test
             const queryText = buildSearchQuery(chat, settings);
             if (queryText) {
                 const { runEventBaseRetrieval } = await import('./eventbase-workflow.js');
-                // Bound retrieval so a hung embedding/query can't freeze the turn.
-                // Soft timeout: on expiry the message proceeds WITHOUT EventBase
-                // injection; the orphaned request is reaped by ST's server-side
-                // timeout. Non-fatal — a thrown timeout/error must not break
-                // generation. See core/constants.js::RETRIEVAL_TIMEOUT_MS.
-                try {
-                    await AsyncUtils.timeout(
-                        runEventBaseRetrieval({
-                            chat,
-                            searchText: queryText,
-                            settings,
-                            chatUUID: getChatUUID(),
-                        }),
-                        RETRIEVAL_TIMEOUT_MS,
-                        'EventBase retrieval timed out',
-                    );
-                } catch (error) {
-                    log.error('VectFox EventBase: retrieval error (non-fatal, message sends without event memory):', error);
-                }
+                // On timeout the message proceeds WITHOUT EventBase injection and
+                // the user is told why — see core/bounded-retrieval.js for the
+                // timeout/degrade/surface contract shared by every retrieval path.
+                //
+                // This is the ONE path that can route through Agent Mode, whose
+                // planner call and query fanout run INSIDE this bound with their
+                // own user-set timeouts. Passing the Agent Mode-inclusive budget
+                // is what keeps the outer bound from silently overruling them.
+                await runBoundedRetrieval(
+                    runEventBaseRetrieval({
+                        chat,
+                        searchText: queryText,
+                        settings,
+                        chatUUID: getChatUUID(),
+                    }),
+                    {
+                        contextLabel: 'EventBase',
+                        sourceName: 'event memory',
+                        timeoutMessage: 'EventBase retrieval timed out',
+                        settings,
+                        timeoutMs: resolveEventBaseRetrievalTimeoutMs(settings),
+                    },
+                );
             } else {
                 // Empty query — clear any stale injection from a previous generation.
                 const { setExtensionPrompt } = await import('../../../../../script.js');
@@ -1327,15 +1360,26 @@ export async function rearrangeChat(chat, settings, type, { dryRun = false, test
             // events every turn, independent of semantic retrieval above. Self-clears
             // when disabled (so a toggle-off mid-session doesn't leave a stale block).
             // Non-fatal + time-bounded so a slow listChunks can't freeze the turn.
-            try {
+            {
                 const { runSummarizerInjection } = await import('./summarizer-injection.js');
-                await AsyncUtils.timeout(
-                    runSummarizerInjection(settings),
-                    RETRIEVAL_TIMEOUT_MS,
-                    'Summarizer injection timed out',
-                );
+                await runBoundedRetrieval(runSummarizerInjection(settings), {
+                    contextLabel: 'Summarizer',
+                    sourceName: 'recent event summaries',
+                    timeoutMessage: 'Summarizer injection timed out',
+                    settings,
+                });
+            }
+
+            // Ghosting: blank the OLDEST already-vectorized messages from THIS prompt
+            // only (non-destructive clone; resets next gen). Self-gates to ghost +
+            // summarizer enabled. Runs AFTER retrieval/injection and buildSearchQuery,
+            // and the wiped span (old history, below the tip) sits below the ChunkBase
+            // condition dedup tail — so query + conditions are unaffected.
+            try {
+                const { applyGhosting } = await import('./summarizer-injection.js');
+                applyGhosting(chat, settings);
             } catch (error) {
-                log.error('VectFox Summarizer: injection error (non-fatal, message sends without summarizer memory):', error);
+                log.error('VectFox Ghost: prompt wipe error (non-fatal):', error);
             }
         } // end if (!dryRun) EventBase block
 
@@ -1441,21 +1485,18 @@ export async function rearrangeChat(chat, settings, type, { dryRun = false, test
             toastr.info(`Retrieving context from ${activeCollections.length} collection(s)...`, 'VectFox Retrieval');
         }
 
-        // Bound chunk retrieval the same way as EventBase above — a hung query
-        // must not freeze generation. On timeout/error we proceed with no chunks
-        // this turn (downstream handles an empty list = no injection).
-        // See core/constants.js::RETRIEVAL_TIMEOUT_MS.
-        let chunks;
-        try {
-            chunks = await AsyncUtils.timeout(
-                queryAndMergeCollections(activeCollections, queryText, settings, chat, debugData),
-                RETRIEVAL_TIMEOUT_MS,
-                'Chunk retrieval timed out',
-            );
-        } catch (error) {
-            log.error('VectFox: chunk retrieval error (non-fatal, message sends without chunk memory):', error);
-            chunks = [];
-        }
+        // Same contract as EventBase above (core/bounded-retrieval.js): on failure
+        // we proceed with no chunks this turn and say so.
+        let chunks = await runBoundedRetrieval(
+            queryAndMergeCollections(activeCollections, queryText, settings, chat, debugData),
+            {
+                contextLabel: 'Chat memory',
+                sourceName: 'vectorized chunks',
+                timeoutMessage: 'Chunk retrieval timed out',
+                fallback: [],   // downstream treats an empty list as "no injection"
+                settings,
+            },
+        );
 
         if (activeCollections.length > 0 && settings.retrieval_popup_on_result) {
             toastr.success(`Retrieved ${chunks.length} result(s) from backend`, 'VectFox Retrieval');
@@ -1670,7 +1711,7 @@ export async function vectorizeAll(settings, batchSize, abortSignal = null, {
             ? allMessages.slice(Math.min(startFromMessage - 1, allMessages.length))
             : allMessages;
 
-        const { runEventBaseIngestion } = await import('./eventbase-workflow.js');
+        const { runEventBaseIngestion, countUnfinishedWindows } = await import('./eventbase-workflow.js');
         const result = await runEventBaseIngestion({
             messages,
             chatUUID: getChatUUID(),
@@ -1689,6 +1730,21 @@ export async function vectorizeAll(settings, batchSize, abortSignal = null, {
 
         if (abortSignal?.aborted) {
             progressTracker.complete(false, `Stopped — saved ${result.eventsExtracted} events from ${result.windowsProcessed} windows so far`);
+            return;
+        }
+
+        // runEventBaseIngestion has already set the progress verdict, and when a
+        // window timed out or failed that verdict is complete(false, …) naming the
+        // reason. Leave it standing — the unconditional green tick that used to be
+        // here overwrote it, so a run that extracted nothing still looked clean.
+        const unfinishedWindows = countUnfinishedWindows(result);
+        if (unfinishedWindows > 0) {
+            toastr.warning(
+                `EventBase: extracted ${result.eventsExtracted} events from ${result.windowsProcessed} windows, `
+                + `but ${unfinishedWindows} window(s) produced nothing. They were not stored and will be retried next run — see the console.`,
+                'VectFox',
+            );
+            log.warn(`VectFox: Vectorization finished with gaps — ${result.eventsExtracted} events, ${result.windowsProcessed} windows processed, ${unfinishedWindows} unfinished`);
             return;
         }
 

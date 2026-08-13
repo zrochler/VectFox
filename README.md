@@ -179,6 +179,17 @@ Because "most recent" only means anything if the database is current, the featur
 
 > 💡 Think of it as the one genuinely useful thing rolling-summary extensions do — *"always remind the AI what just happened"* — rebuilt on EventBase's structured events instead of a lossy recursive text blob. You get the guaranteed recent context **without** the detail-destroying re-summarization.
 
+#### 👻 Ghost vectorized messages — the token-saver payoff
+
+Once Summarizer Injection guarantees the recent thread is always in the prompt, the raw text of *older* messages becomes redundant — those turns already live in EventBase, and the structured recap above covers the recent ones. **Ghosting** cashes that in: every turn it keeps the most recent N messages verbatim and **blanks all older already-vectorized messages from the outgoing prompt**, so the model leans on EventBase memory (the injection above + semantic retrieval) instead of paying for the same history twice.
+
+- **Nothing is destroyed.** The wipe happens on a throwaway copy of the prompt only — your chat UI and the saved file are **untouched**, and the effect **resets every turn** (nothing to un-ghost, branch-safe). Lower the slider and the recap simply reaches further back next turn.
+- **Scales to any chat length.** "Keep the last N raw" auto-scales — a 2,000-message chat sends roughly the same number of raw turns as a 200-message one, with everything older served from memory. Token cost stops growing with chat length.
+- **Recall is the dial.** The fewer raw turns you keep, the more the AI relies on retrieval quality — so **check your recall as you lower the slider** and stop where the model still tracks the scene cleanly.
+- **World Info stays safe.** The wipe is floored so it never blanks a message World Info needs to scan, and it auto-pauses if WI could scan the whole chat — keyword triggers keep firing at any slider value.
+
+Because it leans entirely on EventBase being current, ghosting **requires Summarizer Injection** (which in turn forces the auto-sync window to 1, keeping the database one turn behind the live chat). Enable it right under Summarizer Injection in the **AutoSync** tab; default off.
+
 ### 🧠 Difference between traditional memory extensions
 
 Most existing memory extensions use one of two approaches. Both lose detail as the chat grows. Here's why — and how EventBase avoids it:
@@ -489,10 +500,29 @@ That's it! VectFox will be downloaded and enabled automatically.
 
 If you are on the Standard backend and do not install the plugin, event search and injection still work correctly — you just won't have chunk inspection or keyword metadata. For the best retrieval quality, **Qdrant is strongly recommended** — the free cloud tier at https://qdrant.tech/ requires no local setup at all.
 
+#### First-time on Windows? Install Git and Node.js first
+
+The install commands below use `git` and `npm`. On Windows you need to install these once before they will work. (If you already run SillyTavern from source you have Node.js/npm already — you may only need Git.)
+
+1. Press the **Windows key**, type **`cmd`**, and press **Enter**. A black Command Prompt window opens.
+2. Type these two commands one at a time, pressing **Enter** after each and letting it finish:
+
+   ```bat
+   winget install Git.Git
+   winget install OpenJS.NodeJS.LTS
+   ```
+
+   `Git.Git` gives you the `git` command; `OpenJS.NodeJS.LTS` installs Node.js, which includes `npm`. `winget` is built into Windows 10/11 — nothing extra to install.
+3. **Close the Command Prompt and open a new one** (repeat step 1) so the new commands are picked up.
+4. Verify: type `git --version` then `npm --version`. Each should print a version number.
+
+> On **Linux/Mac**, install Git and Node.js with your package manager instead (e.g. `sudo apt install git nodejs npm`, or `brew install git node`).
+
 #### Instruction on installing the plugin:
 
+Open the Command Prompt (Windows) / Terminal (Linux/Mac) / Console (Docker), then run:
+
 ```bash
-Open Command prompt on Windows or Terminal on Linux/Mac or Get into Console if you are on docker
 cd SillyTavern/plugins
 git clone -b Similharity-Plugin https://github.com/KritBlade/VectFox.git similharity
 cd similharity
@@ -504,6 +534,8 @@ Search the following key in `config.yaml` and change to true:  (Windows will be 
 ```yaml
 enableServerPlugins: true
 ```
+
+> 📌 **Installing with `git clone` above is what keeps the plugin updating itself.** A ZIP download cannot auto-update, and a silently outdated plugin is the single most common cause of hard-to-diagnose bugs. See [🔄 Auto-Updates](#-auto-updates) to verify it is working.
 
 Restart SillyTavern.
 
@@ -529,11 +561,25 @@ Restart SillyTavern.
 
 ## 🔄 Auto-Updates
 
-VectFox has `auto_update: true` in its manifest. If you installed via `git clone`, SillyTavern will automatically check for and apply updates!
+VectFox has **two halves that update separately**: the extension (this repo) and the Similharity server plugin (Step 2 above). Updating one does not update the other, and a stale plugin against a current extension is a combination we do not test — it produces confusing, hard-to-diagnose failures. Keep both current.
+
+### The extension
+
+VectFox has `auto_update: true` in its manifest. If you installed via `git clone`, SillyTavern will automatically check for and apply updates.
 
 Look for the update notification in the Extensions panel, or manually check with the "Check for Updates" button.
 
-Setting enableServerPlugin to true is required for Qdrant backend.
+### The Similharity plugin
+
+**If you installed the plugin via `git clone` (Step 2 above)**, it updates automatically every time you restart SillyTavern — SillyTavern runs `git pull` on every plugin folder that is a git repository at startup. This is enabled by default.
+
+**If you downloaded the plugin as a ZIP**, auto-updates will **not** work — there is no `.git` folder for SillyTavern to pull. This is the most common cause of a silently outdated plugin. To fix:
+
+1. Delete the `SillyTavern/plugins/similharity` folder.
+2. Reinstall via `git clone` — see Step 2 above.
+3. Your settings and vectorized data live elsewhere and are not affected.
+
+> ⚠️ **Leave both server-plugin settings on.** `enableServerPlugins: true` is required for the Qdrant backend, and for any plugin-backed feature on the Standard backend. `enableServerPluginsAutoUpdate` is a separate setting that defaults to `true` — leave it that way. If you turn it off, the plugin stays frozen at whatever version you installed while the extension keeps updating, and nothing tells you it has gone stale. You will only find out later, when a plugin update you never received causes a failure that is very hard to trace back to its real cause.
 
 ---
 
@@ -596,6 +642,21 @@ The problem it solves: sometimes a request to a cloud embedding provider doesn't
 Hedging fixes this. If a request hasn't answered within the time limit (15s), VectFox quietly fires a **second, identical request on a fresh connection** — without cancelling the first. Whichever one replies first wins; the loser is thrown away. The fresh connection usually gets routed to a *healthy* worker, so you recover in seconds instead of waiting out the full timeout. (Sending the same text twice is harmless — a duplicate just overwrites the same database entry with identical data.)
 
 > 💡 Leave it on — it only ever activates when something is already going wrong, and it makes flaky cloud providers far less painful. It's automatically skipped for **local** models (Ollama, Transformers, llama.cpp, KoboldCpp), where a second connection wouldn't change anything. Set it to `0` to disable.
+
+**How do I configure NanoGPT as a provider?**
+First select **vLLM** as the provider — that's the OpenAI-compatible slot that exposes the custom URL fields NanoGPT needs. From there the embedding and summariser endpoints must be set up *differently*; the same base URL won't work for both. These settings are courtesy of Reddit user **[u/aturbofrog](https://www.reddit.com/user/aturbofrog/)**:
+
+| Setting             | Value                                                                                          |
+| ------------------- | ---------------------------------------------------------------------------------------------- |
+| **Embeddings URL**  | `https://nano-gpt.com/api/v1/embeddings` — the full path is required; the base URL alone fails |
+| **Embeddings Model**| `Qwen/Qwen3-Embedding-8B`                                                                       |
+| **Summariser URL**  | `https://nano-gpt.com/api/v1/` — leave it at the base; appending `chat/completions` oddly fails the tests |
+| **Summariser Model**| `nvidia/nemotron-3-ultra-550b-a55b` (or any chat model you prefer)                              |
+
+A couple of gotchas:
+
+- **Enable paid models.** For embeddings to pass VectFox's connection tests, toggle **"Enable paid models on API"** on in your NanoGPT account settings.
+- **Zero output tokens is normal.** The NanoGPT usage page shows **zero output tokens** for every embedding run — that's expected (embeddings don't generate output tokens), not a sign anything is broken.
 
 ---
 
