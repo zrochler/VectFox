@@ -38,20 +38,6 @@ export { getAutoSyncWindowSize, getAutoSyncTailLagMessages };
 const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
 
 /**
- * Resolve the auto-sync extraction window size in MESSAGES from the per-user
- * turns setting (1 turn = 2 messages: 1 user + 1 AI reply). Clamped to 1-20 turns.
- * Auto-sync uses this instead of settings.eventbase_window_size so its cadence is
- * independent of the one-off Vectorize Content window. Single source of truth for
- * the conversion — used by the auto-sync caller AND the auto-sync status check.
- * @param {object} settings - VectFox settings
- * @returns {number} window size in messages
- */
-export function getAutoSyncWindowSize(settings) {
-    const turns = Math.max(1, Math.min(20, settings?.eventbase_autosync_window_turns ?? 1));
-    return turns * 2;
-}
-
-/**
  * Settle/commit lag boundary: the number of messages eligible for auto-sync
  * extraction. The last `lag` messages — the active, still-swipeable turn — are
  * held back until a newer message supersedes them, so re-rolls/swipes on the
