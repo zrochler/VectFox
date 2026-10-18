@@ -298,6 +298,18 @@ export function ensureChatUUID({ forceRefresh = false } = {}) {
         : `vf-chat-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 
     chat_metadata.vectfox_uuid = generated;
+
+    try {
+        const context = getContext();
+        if (context && typeof context.saveMetadata === 'function') {
+            Promise.resolve(context.saveMetadata()).catch((error) => {
+                log?.warn?.('VectFox: failed to save chat metadata after generating UUID', error);
+            });
+        }
+    } catch (error) {
+        log?.warn?.('VectFox: unable to save chat metadata after generating UUID', error);
+    }
+
     return generated;
 }
 
