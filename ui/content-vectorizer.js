@@ -27,6 +27,7 @@ import {
 import { extension_settings, getContext } from '../../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
 import { getChatUUID, vectorizeAll } from '../core/chat-vectorization.js';
+import { ensureChatUUID } from '../core/collection-ids.js';
 import { validateLLMConfig } from '../core/summarizer.js';
 import { getOpenRouterApiKey } from '../core/api-keys.js';
 import StringUtils from '../utils/string-utils.js';
@@ -3109,7 +3110,7 @@ async function _runEventBaseBackfill({ resetCaches = false } = {}) {
                 return;
             }
 
-            chatUUID = getChatUUID();
+            chatUUID = ensureChatUUID({ forceRefresh: true });
             await maybeResetCaches(chatUUID);
 
             // Window-size-change warning. The window fingerprint dedup cache is

@@ -278,19 +278,59 @@ export function resolveBackendForCollection(input) {
 // ============================================================================
 
 /**
- * Gets the unique chat UUID from chat_metadata.integrity
- * This is the authoritative identifier for a chat.
- * @returns {string|null} Chat UUID or null if no chat
+ * Generates a new UUID for the current chat and persists it in chat_metadata.
+ * We intentionally keep this separate from ST's `chat_metadata.integrity`, which
+ * is not a stable VectFox anchor for vectorized chats.
+ * @returns {string|null} Generated UUID or null if no chat metadata object exists
+ */
+export function ensureChatUUID({ forceRefresh = false } = {}) {
+    if (!chat_metadata || typeof chat_metadata !== 'object') {
+        return null;
+    }
+
+    const existing = chat_metadata.vectfox_uuid;
+    if (existing && !forceRefresh) {
+        return existing;
+    }
+
+    const generated = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `vf-chat-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+
+    chat_metadata.vectfox_uuid = generated;
+    return generated;
+}
+
+/**
+ * Gets the stable VectFox UUID for the current chat.
+ * Prefers the persisted VectFox metadata key, seeds it from a legacy
+ * `chat_metadata.integrity` if present for compatibility, and otherwise creates
+ * a fresh UUID so vectorization always has a stable anchor.
+ * @returns {string|null} Chat UUID or null if impossible to determine
  */
 export function getChatUUID() {
-    const integrity = chat_metadata?.integrity;
-    if (integrity) {
-        return integrity;
+    if (chat_metadata && typeof chat_metadata === 'object') {
+        const stored = chat_metadata.vectfox_uuid;
+        if (stored) {
+            return stored;
+        }
+
+        const legacyIntegrity = chat_metadata.integrity;
+        if (legacyIntegrity && typeof legacyIntegrity === 'string' && legacyIntegrity.trim()) {
+            chat_metadata.vectfox_uuid = legacyIntegrity;
+            return legacyIntegrity;
+        }
+
+        const generated = ensureChatUUID({ forceRefresh: true });
+        if (generated) {
+            return generated;
+        }
     }
-    // Fallback: use chatId (less ideal but works for old chats)
+
+    // Final compatibility fallback for old chats before VectFox metadata exists.
     const chatId = getCurrentChatId();
     if (chatId) {
-        log.warn('VectFox: chat_metadata.integrity not found, falling back to chatId');
+        log.warn('VectFox: no stable VectFox chat UUID found; falling back to chatId');
         return chatId;
     }
     return null;

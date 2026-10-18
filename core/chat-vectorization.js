@@ -42,6 +42,7 @@ import { isVectFoxEnabled } from './feature-gate.js';
 // Import from collection-ids.js - single source of truth for collection ID operations
 import {
     getChatUUID,
+    ensureChatUUID,
     COLLECTION_PREFIXES,
     INTERNAL_COLLECTION_IDS,
     parseCollectionId,
@@ -1719,6 +1720,7 @@ export async function vectorizeAll(settings, batchSize, abortSignal = null, {
         const context = getContext();
         if (!Array.isArray(context.chat)) return;
 
+        const activeChatUUID = ensureChatUUID({ forceRefresh: true });
         const allMessages = context.chat.filter(m => m.mes && m.mes.trim().length > 0);
         const messages = startFromMessage > 1
             ? allMessages.slice(Math.min(startFromMessage - 1, allMessages.length))
@@ -1727,7 +1729,7 @@ export async function vectorizeAll(settings, batchSize, abortSignal = null, {
         const { runEventBaseIngestion, countUnfinishedWindows } = await import('./eventbase-workflow.js');
         const result = await runEventBaseIngestion({
             messages,
-            chatUUID: getChatUUID(),
+            chatUUID: activeChatUUID,
             settings,
             abortSignal,
             isAutoSync: false,

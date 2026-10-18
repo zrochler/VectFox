@@ -6,20 +6,50 @@
  * resolve to the same module ids from /tests/ as from /core/ (both are direct
  * children of the repo root) — same trick used by world-info-integration.test.js.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const { scriptState } = vi.hoisted(() => ({
+    scriptState: {
+        getCurrentChatId: () => null,
+        chat_metadata: {},
+    },
+}));
 
 vi.mock('../../../../extensions.js', () => ({
     getContext: vi.fn(() => ({ name1: 'user' })),
 }));
 vi.mock('../../../../../script.js', () => ({
-    getCurrentChatId: vi.fn(() => null),
-    chat_metadata: {},
+    getCurrentChatId: () => scriptState.getCurrentChatId(),
+    get chat_metadata() {
+        return scriptState.chat_metadata;
+    },
 }));
 vi.mock('../core/log.js', () => ({
-    log: new Proxy({}, { get: () => () => {} }),
+    log: new Proxy({}, { get: () => () => { } }),
 }));
 
-import { remapCollectionIdToHandle, sanitizeHandleId, sanitizeNameSegment, sanitizeIdSegment } from '../core/collection-ids.js';
+import { remapCollectionIdToHandle, sanitizeHandleId, sanitizeNameSegment, sanitizeIdSegment, getChatUUID } from '../core/collection-ids.js';
+
+describe('getChatUUID', () => {
+    beforeEach(() => {
+        scriptState.getCurrentChatId = () => 'chat-123';
+        scriptState.chat_metadata = {};
+    });
+
+    it('creates and persists a vectfox UUID when the chat metadata has none', () => {
+        const uuid = getChatUUID();
+
+        expect(uuid).toBeTruthy();
+        expect(scriptState.chat_metadata.vectfox_uuid).toBe(uuid);
+        expect(uuid).not.toBe('chat-123');
+    });
+
+    it('uses the persisted vectfox UUID instead of chat_metadata.integrity', () => {
+        scriptState.chat_metadata = { integrity: 'st-integrity', vectfox_uuid: 'vf-chat-abc' };
+
+        expect(getChatUUID()).toBe('vf-chat-abc');
+    });
+});
 
 describe('sanitizeIdSegment (primitive)', () => {
     it('does not edge-trim or apply fallback by default', () => {
