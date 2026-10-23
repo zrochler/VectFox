@@ -104,6 +104,7 @@ vi.mock('../core/constants.js', () => ({
 import { StandardBackend } from '../backends/standard.js';
 import { QdrantBackend } from '../backends/qdrant.js';
 import { VectorBackend } from '../backends/backend-interface.js';
+import { parseRegistryKey } from '../core/collection-ids.js';
 
 // =============================================================================
 // TEST UTILITIES
@@ -561,6 +562,26 @@ describe('QdrantBackend', () => {
         it('should strip backend:source: prefix', () => {
             expect(backend._stripRegistryPrefix('qdrant:openai:my-collection'))
                 .toBe('my-collection');
+        });
+    });
+
+    describe('parseRegistryKey', () => {
+        it('should split legacy backend:source:collectionId keys correctly', () => {
+            const result = parseRegistryKey('qdrant:transformers:vf_eventbase_user_char_123');
+            expect(result).toEqual({
+                backend: 'qdrant',
+                source: 'transformers',
+                collectionId: 'vf_eventbase_user_char_123',
+            });
+        });
+
+        it('should keep current backend:collectionId keys intact', () => {
+            const result = parseRegistryKey('qdrant:vf_eventbase_user_char_123');
+            expect(result).toEqual({
+                backend: 'qdrant',
+                source: null,
+                collectionId: 'vf_eventbase_user_char_123',
+            });
         });
     });
 

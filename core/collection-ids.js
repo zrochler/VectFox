@@ -672,7 +672,8 @@ export function matchesPatterns(collectionId, patterns) {
 /**
  * Extracts backend and source from a registry key
  * Registry keys can be:
- * - "backend:source:collectionId" (new format)
+ * - "backend:collectionId" (current canonical format)
+ * - "backend:source:collectionId" (legacy compatibility format)
  * - "source:collectionId" (migration format)
  * - "collectionId" (legacy format)
  *
@@ -686,14 +687,37 @@ export function parseRegistryKey(registryKey) {
 
     // Known storage backends
     const knownBackends = ['standard', 'vectra', 'qdrant'];
+    const knownSources = ['transformers', 'openai', 'cohere', 'ollama', 'llamacpp',
+        'vllm', 'koboldcpp', 'webllm', 'openrouter'];
 
     const parts = registryKey.split(':');
 
-    // Current format: backend:collectionId (starts with a known backend)
+    // Current canonical format: backend:collectionId
     if (parts.length >= 2 && knownBackends.includes(parts[0])) {
+        const remainder = parts.slice(1).join(':');
+
+        // Legacy compatibility: backend:source:collectionId
+        // Example: qdrant:transformers:vf_eventbase_...
+        if (parts.length >= 3 && knownSources.includes(parts[1])) {
+            return {
+                backend: parts[0],
+                source: parts[1],
+                collectionId: remainder.slice(parts[1].length + 1),
+            };
+        }
+
         return {
             backend: parts[0],
             source: null,
+            collectionId: remainder,
+        };
+    }
+
+    // Legacy migration format: source:collectionId
+    if (parts.length >= 2 && knownSources.includes(parts[0])) {
+        return {
+            backend: null,
+            source: parts[0],
             collectionId: parts.slice(1).join(':'),
         };
     }
